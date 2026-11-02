@@ -16,7 +16,7 @@
 set -euo pipefail
 umask 077
 
-BWCC_VERSION="0.1.0"
+BWCC_VERSION="0.1.1"
 
 # ---------------------------------------------------------------------------
 # configuration (all overridable by environment)
@@ -245,12 +245,26 @@ unlock_with_password() {
 }
 
 do_unlock() {
-  local key=""
-  if [ "$USE_BIOMETRICS" = "1" ]; then
-    key="$(unlock_with_biometrics || true)"
-  fi
+  local key="" flag try_bio=0
+  flag="$(biometrics_flag)"
+  case "$USE_BIOMETRICS" in
+    0)     try_bio=0 ;;
+    force) try_bio=1 ;;
+    *)     [ "$flag" = "false" ] || try_bio=1 ;;
+  esac
+
+  [ "$try_bio" -eq 1 ] && key="$(unlock_with_biometrics || true)"
+
   if [ -z "$key" ]; then
-    [ "$USE_BIOMETRICS" = "1" ] && warn "biometria indisponível — caindo para a senha mestra"
+    if [ "$USE_BIOMETRICS" != "0" ]; then
+      if [ "$flag" = "false" ]; then
+        warn "Touch ID indisponível: a flag 'biometrics-sdk-ipc' está desligada no servidor"
+        warn "da Bitwarden para esta conta. Nada a fazer localmente — usando a senha mestra."
+      else
+        warn "biometria indisponível (app desktop fechado, sem Touch ID configurado, ou"
+        warn "cancelada) — usando a senha mestra. Diagnóstico: bwcc doctor"
+      fi
+    fi
     key="$(unlock_with_password || true)"
   fi
   [ -n "$key" ] || die "não consegui desbloquear o cofre (biometria e senha falharam ou foram canceladas)"
@@ -385,9 +399,19 @@ resolve_ref() {
 # commands — read
 # ---------------------------------------------------------------------------
 cmd_status() {
-  local st sj
+  local st sj cached eff flag
   sj="$(bw_status_json)"
   st="$(printf '%s' "$sj" | json -r '.status // "unknown"')"
+
+  # `bw status` sem sessão sempre diz "locked"; o que importa é se o bwcc
+  # consegue ler o cofre AGORA, ou seja, com a sessão que ele tem em cache.
+  cached="$(session_get)"
+  if [ -n "$cached" ] && [ "$st" != "unauthenticated" ]; then
+    eff="$(BW_SESSION="$cached" "$BW_BIN" status 2>/dev/null | tail -n 1 \
+           | json -r '.status // empty' 2>/dev/null || true)"
+    [ -n "$eff" ] && st="$eff (pela sessão em cache)"
+  fi
+  flag="$(biometrics_flag)"
   info "bwcc           $BWCC_VERSION"
   info "bw CLI         $("$BW_BIN" --version 2>/dev/null) ($BW_BIN)"
   info "app desktop    $(desktop_version)"
@@ -397,6 +421,29 @@ cmd_status() {
   info "último sync    $(printf '%s' "$sj" | json -r '.lastSync // "-"')"
   info "sessão em cache $( [ -n "$(session_get)" ] && printf 'sim (expira em %s)' "$(session_remaining)" || printf 'não' )"
   info "store          $SESSION_STORE   TTL ${SESSION_TTL}s   reveal=$REVEAL_POLICY"
+  info "Touch ID       $( [ "$flag" = "true" ] && printf 'disponível' \
+                          || printf 'indisponível (flag biometrics-sdk-ipc=%s)' "$flag" )"
+}
+
+# A biometria do CLI é gateada pela flag `biometrics-sdk-ipc`, que vem do
+# servidor da Bitwarden. Com ela desligada o CLI nem inicia o desktop_proxy,
+# então tentar é só perder tempo. O estado fica no cache de config local.
+biometrics_flag() {
+  local f v
+  if [ $# -gt 0 ]; then set -- "$@"; else
+    set -- "$HOME/Library/Application Support/Bitwarden CLI/data.json" \
+           "$HOME/Library/Application Support/Bitwarden/data.json"
+  fi
+  for f in "$@"; do
+    [ -f "$f" ] || continue
+    # NB: não usar `// empty` aqui — no jq o operador `//` considera `false`
+    # ausente, e `false` é exatamente o valor que precisamos ler.
+    v="$(jq -r '[.. | objects | select(has("featureStates")) | .featureStates["biometrics-sdk-ipc"]]
+                | map(select(. != null))
+                | if length == 0 then "" else (.[0] | tostring) end' "$f" 2>/dev/null || true)"
+    case "$v" in true|false) printf '%s' "$v"; return ;; esac
+  done
+  printf 'desconhecida'
 }
 
 desktop_version() {
@@ -427,6 +474,17 @@ cmd_doctor() {
 
   local proxy="$DESKTOP_APP/Contents/MacOS/desktop_proxy"
   check "desktop_proxy (ponte IPC)" "$( [ -x "$proxy" ] && echo 0 || echo 1 )" "$( [ -x "$proxy" ] && echo "$proxy" || echo 'ausente' )"
+
+  local bf; bf="$(biometrics_flag)"
+  if [ "$bf" = "true" ]; then
+    check "flag biometrics-sdk-ipc" 0 "ligada — Touch ID pelo app desktop disponível"
+  elif [ "$bf" = "false" ]; then
+    check "flag biometrics-sdk-ipc" 1 "DESLIGADA pelo servidor da Bitwarden: o CLI não inicia o"
+    printf '    %s\n' "desktop_proxy, então não há Touch ID. O bwcc usa a senha mestra."
+    printf '    %s\n' "Não é configuração local — é rollout da Bitwarden. Tente: BWCC_BIOMETRICS=force"
+  else
+    check "flag biometrics-sdk-ipc" 1 "não consegui ler o cache de config (abra o app uma vez)"
+  fi
 
   local st; st="$(bw_login_state)"
   check "login" "$( [ "$st" != "unauthenticated" ] && echo 0 || echo 1 )" "$st"

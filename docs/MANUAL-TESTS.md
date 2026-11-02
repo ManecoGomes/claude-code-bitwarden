@@ -9,7 +9,7 @@ Pré-requisito: `bwcc doctor` com tudo ✓ e `bw login` feito.
 | # | Comando | Resultado esperado |
 |---|---|---|
 | 1 | `bwcc status` | `estado unlocked` ou `locked`, conta certa, app detectado |
-| 2 | `bwcc unlock` (cofre travado) | prompt de Touch ID aparece; depois "sessão em cache, expira em 900s" |
+| 2 | `bwcc unlock` (cofre travado) | com `biometrics-sdk-ipc=true`: prompt de Touch ID. Com `false`: aviso explicando a flag + diálogo de senha mestra. Nos dois casos termina em "sessão em cache, expira em 900s" |
 | 3 | `bwcc unlock` de novo, na sequência | **sem** novo Touch ID (cache válido) |
 | 4 | `bwcc list` | tabela com NOME/USUÁRIO/URI/ID, nenhuma senha |
 | 5 | `bwcc fields "<item>"` | lista de campos, marcando `(secreto)`, **sem valores** |
@@ -27,6 +27,8 @@ Pré-requisito: `bwcc doctor` com tudo ✓ e `bw login` feito.
 | 17 | `BWCC_BIOMETRICS=0 bwcc unlock` | diálogo de senha mestra em vez de Touch ID |
 | 18 | `BWCC_SESSION_TTL=5 bwcc unlock; sleep 6; bwcc list` | sessão expirou, pede Touch ID |
 | 19 | app desktop fechado, `bwcc unlock` | avisa "biometria indisponível" e cai na senha mestra |
+| 21 | `bwcc doctor \| grep biometrics` | reporta a flag como ligada/desligada/desconhecida, com explicação |
+| 22 | `BWCC_BIOMETRICS=force bwcc unlock` (flag `false`) | tenta a ponte IPC mesmo assim; espera até o timeout e cai na senha |
 | 20 | `security find-generic-password -s bwcc-session -w` | devolve `<timestamp>:<chave>` — confirma onde a sessão mora |
 
 Limpeza: `bwcc lock` e apague o item `teste-bwcc` no app.

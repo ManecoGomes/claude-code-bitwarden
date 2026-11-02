@@ -32,7 +32,7 @@ ITEM='{"id":"3f1a","name":"GitHub","type":1,
 echo "bwcc — testes offline"
 echo
 echo "superfície do CLI"
-eq "--version imprime a versão" "bwcc 0.1.0" "$("$BWCC" --version)"
+eq "--version imprime a versão" "bwcc 0.1.1" "$("$BWCC" --version)"
 contains "--help documenta o run" "bwcc run" "$("$BWCC" --help)"
 out="$("$BWCC" comando-que-nao-existe 2>&1)"; rc=$?
 eq   "comando inválido sai com erro" "1" "$rc"
@@ -82,6 +82,23 @@ key="AbC123+/defGHIjklMNOpqrSTUvwxYZ0123456789abcdefghijKLMNOPqrstuvwxyz01234567
 dirty="$(printf '\033[32m? Master password:\033[0m \r\nUnlocking...\r\n%s\r\n' "$key")"
 eq "chave extraída de ANSI+CR" "$key" "$(printf '%s' "$dirty" | T extract_session)"
 eq "sem chave devolve vazio"   ""     "$(printf 'erro qualquer\r\n' | T extract_session)"
+
+echo
+echo "flag biometrics-sdk-ipc (regressão: jq trata false como ausente)"
+fx_false="$(mktemp)"; fx_true="$(mktemp)"; fx_none="$(mktemp)"
+cat >"$fx_false" <<'J'
+{"global_config_byServer":{"https://api.bitwarden.com":{"featureStates":{"outra":true,"biometrics-sdk-ipc":false}}}}
+J
+cat >"$fx_true" <<'J'
+{"user_x_config_serverConfig":{"featureStates":{"biometrics-sdk-ipc":true}}}
+J
+printf '{"featureStates":{"outra-flag":true}}\n' >"$fx_none"
+eq "false é lido como false (não como ausente)" "false" "$(T biometrics_flag "$fx_false")"
+eq "true é lido como true"                      "true"  "$(T biometrics_flag "$fx_true")"
+eq "sem a flag -> desconhecida"      "desconhecida" "$(T biometrics_flag "$fx_none")"
+eq "arquivo inexistente -> desconhecida" "desconhecida" "$(T biometrics_flag /nao/existe)"
+eq "primeiro arquivo sem a flag, segundo com" "false" "$(T biometrics_flag "$fx_none" "$fx_false")"
+rm -f "$fx_false" "$fx_true" "$fx_none"
 
 echo
 echo "guardas do inject"
