@@ -689,16 +689,20 @@ cmd_login() {
     exec "$BW_BIN" login "$@"
   fi
   cat >&2 <<'MSG'
-bwcc: `bw login` precisa de um terminal interativo (e-mail, senha mestra e 2FA).
-Rode você mesmo, uma única vez:
+bwcc: `bw login` precisa de um terminal de verdade (e-mail, senha mestra e 2FA).
+Rode você mesmo, uma única vez, no Terminal.app ou iTerm:
 
     bw login
 
-No Claude Code, dá pra rodar direto do prompt com o prefixo "!":
+Não funciona pelo prefixo "!" do Claude Code nem por agente: o CLI usa readline
+e aborta com ERR_USE_AFTER_CLOSE quando não tem tty próprio.
 
-    ! bw login
+Alternativa sem prompt nenhum, com a API key pessoal do cofre web
+(Configurações -> Segurança -> Chaves -> Ver chave de API):
 
-Depois disso o bwcc cuida de desbloquear com Touch ID a cada sessão.
+    BW_CLIENTID=... BW_CLIENTSECRET=... bw login --apikey
+
+Depois do login, o bwcc cuida de desbloquear com Touch ID a cada sessão.
 MSG
   exit 2
 }

@@ -69,6 +69,13 @@ bw login              # uma vez só — tem 2FA, é você que digita
 bwcc doctor           # confere CLI, app, ponte IPC, Keychain e login
 ```
 
+> **O `bw login` tem que ser num terminal de verdade** (Terminal.app, iTerm).
+> Não funciona por agente nem pelo prefixo `!` do Claude Code: o CLI usa readline
+> e aborta com `ERR_USE_AFTER_CLOSE` quando não tem tty próprio. Quem precisa de
+> login sem prompt usa a API key pessoal do cofre web:
+> `BW_CLIENTID=... BW_CLIENTSECRET=... bw login --apikey`.
+> Isso é só o login: o **desbloqueio** depois é por Touch ID, e disso o `bwcc` cuida.
+
 E, dentro do Claude Code:
 
 ```

@@ -82,7 +82,7 @@ pra remover ou alterar algo no cofre, diga que ele faz isso no app do Bitwarden.
 
 | Situação | O que fazer |
 |---|---|
-| `você não está logado` | Ele precisa rodar `bw login` uma vez num terminal próprio. No Claude Code: `! bw login`. Não tente logar por ele — tem 2FA. |
+| `você não está logado` | Ele precisa rodar `bw login` uma vez **no Terminal.app ou iTerm**. Não tente logar por ele e **não use o prefixo `!`**: o CLI usa readline e morre com `ERR_USE_AFTER_CLOSE` sem tty próprio. Dá pra abrir o terminal pra ele: `osascript -e 'tell application "Terminal" to do script "bw login"'`. Quem não quer prompt usa `bw login --apikey` com `BW_CLIENTID`/`BW_CLIENTSECRET`. |
 | primeiro comando da sessão demora | É o Touch ID: o app desktop abriu o prompt. Normal. |
 | `biometria indisponível` | Abre um diálogo pedindo a senha mestra. Se o usuário não esperava, mande ele conferir se o app desktop está aberto e com biometria ligada, e rodar `bwcc doctor`. |
 | algo esquisito na instalação | `bwcc doctor` diagnostica tudo (CLI, app, proxy IPC, Keychain, login). |
