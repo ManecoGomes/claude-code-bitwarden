@@ -1,0 +1,10 @@
+# nunca versionar segredo nem estado local
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+session
+.DS_Store
+node_modules/

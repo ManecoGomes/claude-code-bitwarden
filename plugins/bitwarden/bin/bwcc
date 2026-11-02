@@ -1,0 +1,837 @@
+#!/usr/bin/env bash
+# bwcc — Bitwarden for Claude Code
+#
+# A thin, auditable wrapper around the official Bitwarden CLI (`bw`) that gives
+# an AI coding agent safe access to a Bitwarden vault on macOS:
+#
+#   * unlocks via the Bitwarden desktop app (Touch ID), like `op` does for 1Password
+#   * caches the session key in the macOS Keychain with a sliding TTL
+#   * never prints secret values unless explicitly asked (--reveal / --copy)
+#   * can inject secrets into child processes and files without them ever being
+#     printed to the terminal (and therefore without entering an AI transcript)
+#
+# Project: https://github.com/ManecoGomes/claude-code-bitwarden
+# License: MIT
+
+set -euo pipefail
+umask 077
+
+BWCC_VERSION="0.1.0"
+
+# ---------------------------------------------------------------------------
+# configuration (all overridable by environment)
+# ---------------------------------------------------------------------------
+BW_BIN="${BWCC_BW_BIN:-}"
+SESSION_TTL="${BWCC_SESSION_TTL:-900}"            # seconds; 0 = no expiry
+SESSION_STORE="${BWCC_SESSION_STORE:-keychain}"   # keychain | file
+KC_SERVICE="${BWCC_KEYCHAIN_SERVICE:-bwcc-session}"
+KC_ACCOUNT="${BWCC_KEYCHAIN_ACCOUNT:-${USER:-bwcc}}"
+STATE_DIR="${BWCC_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/bwcc}"
+REVEAL_POLICY="${BWCC_REVEAL:-never}"             # never | always
+USE_BIOMETRICS="${BWCC_BIOMETRICS:-1}"
+UNLOCK_TIMEOUT="${BWCC_UNLOCK_TIMEOUT:-90}"
+DESKTOP_APP="${BWCC_DESKTOP_APP:-/Applications/Bitwarden.app}"
+
+# ---------------------------------------------------------------------------
+# small helpers
+# ---------------------------------------------------------------------------
+die() { printf 'bwcc: %s\n' "$1" >&2; exit "${2:-1}"; }
+warn() { printf 'bwcc: %s\n' "$1" >&2; }
+info() { printf '%s\n' "$1"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+require_bash() {
+  if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 3 ]; then
+    die "requer bash 3.2 ou mais novo"
+  fi
+}
+
+resolve_bw() {
+  if [ -n "$BW_BIN" ]; then
+    [ -x "$BW_BIN" ] || die "BWCC_BW_BIN não é executável: $BW_BIN"
+    return 0
+  fi
+  BW_BIN="$(command -v bw || true)"
+  [ -n "$BW_BIN" ] || die "CLI do Bitwarden não encontrado. Instale com: npm install -g @bitwarden/cli"
+}
+
+# run a command with a wall-clock timeout, portable to macOS (no coreutils)
+run_with_timeout() {
+  local secs="$1"; shift
+  "$@" &
+  local pid=$!
+  (
+    sleep "$secs"
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 2
+    kill -KILL "$pid" 2>/dev/null || true
+  ) >/dev/null 2>&1 &
+  local watcher=$!
+  local rc=0
+  wait "$pid" 2>/dev/null || rc=$?
+  kill "$watcher" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true
+  return "$rc"
+}
+
+# Pull a Bitwarden session key out of noisy pty output (prompts, ANSI, CRs).
+extract_session() {
+  LC_ALL=C sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\r//g' \
+    | grep -oE '[A-Za-z0-9+/]{43,}={0,2}' \
+    | tail -n 1
+}
+
+# Non-reversible short fingerprint, so a value can be identified without
+# being disclosed.
+fingerprint() {
+  local v="$1" h
+  if have shasum; then h="$(printf '%s' "$v" | shasum -a 256 | cut -c1-8)"
+  else h="????????"; fi
+  printf '%s' "$h"
+}
+
+mask_value() {
+  local v="$1"
+  printf '•••••••• (%d chars, sha256:%s)' "${#v}" "$(fingerprint "$v")"
+}
+
+# Print a secret according to policy. $1=value $2=label
+emit_secret() {
+  local value="$1" label="${2:-valor}"
+  case "$OPT_OUTPUT" in
+    reveal)
+      printf '%s\n' "$value"
+      ;;
+    copy)
+      printf '%s' "$value" | pbcopy
+      info "$label copiado para a área de transferência (não foi exibido)."
+      ;;
+    *)
+      if [ "$REVEAL_POLICY" = "always" ]; then
+        printf '%s\n' "$value"
+      else
+        printf '%s: %s\n' "$label" "$(mask_value "$value")"
+        info "Para usar o valor: --copy (área de transferência), --reveal (imprime), ou 'bwcc run'."
+      fi
+      ;;
+  esac
+}
+
+json() {
+  if have jq; then jq "$@"; else die "jq é necessário (brew install jq)"; fi
+}
+
+# ---------------------------------------------------------------------------
+# session cache  (payload format: "<unix-ts>:<session-key>")
+# ---------------------------------------------------------------------------
+session_put() {
+  local payload
+  payload="$(date +%s):$1"
+  case "$SESSION_STORE" in
+    keychain)
+      security add-generic-password -a "$KC_ACCOUNT" -s "$KC_SERVICE" \
+        -D "bwcc session key" -w "$payload" -U >/dev/null 2>&1 \
+        || die "não consegui gravar a sessão no Keychain"
+      ;;
+    file)
+      mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+      printf '%s' "$payload" >"$STATE_DIR/session"
+      chmod 600 "$STATE_DIR/session"
+      ;;
+    none) : ;;
+    *) die "BWCC_SESSION_STORE inválido: $SESSION_STORE" ;;
+  esac
+}
+
+session_raw() {
+  case "$SESSION_STORE" in
+    keychain) security find-generic-password -a "$KC_ACCOUNT" -s "$KC_SERVICE" -w 2>/dev/null || true ;;
+    file) cat "$STATE_DIR/session" 2>/dev/null || true ;;
+    *) printf '' ;;
+  esac
+}
+
+session_clear() {
+  case "$SESSION_STORE" in
+    keychain) security delete-generic-password -a "$KC_ACCOUNT" -s "$KC_SERVICE" >/dev/null 2>&1 || true ;;
+    file) rm -f "$STATE_DIR/session" ;;
+  esac
+}
+
+# echoes the cached key if still within TTL, nothing otherwise
+session_get() {
+  local payload ts key now
+  payload="$(session_raw)"
+  [ -n "$payload" ] || return 0
+  ts="${payload%%:*}"; key="${payload#*:}"
+  case "$ts" in ''|*[!0-9]*) session_clear; return 0 ;; esac
+  [ -n "$key" ] || { session_clear; return 0; }
+  if [ "$SESSION_TTL" -gt 0 ]; then
+    now="$(date +%s)"
+    if [ "$(( now - ts ))" -ge "$SESSION_TTL" ]; then session_clear; return 0; fi
+  fi
+  printf '%s' "$key"
+}
+
+# seconds left on the cached session; "-" when none / no expiry
+session_remaining() {
+  local payload ts now
+  payload="$(session_raw)"
+  [ -n "$payload" ] || { printf '%s' "-"; return; }
+  ts="${payload%%:*}"
+  case "$ts" in ''|*[!0-9]*) printf '%s' "-"; return ;; esac
+  [ "$SESSION_TTL" -gt 0 ] || { printf '%s' "sem expiração"; return; }
+  now="$(date +%s)"
+  local left=$(( SESSION_TTL - (now - ts) ))
+  if [ "$left" -le 0 ]; then printf '%s' "expirada"; else printf '%ds' "$left"; fi
+}
+
+bw_status_json() {
+  BW_SESSION="" "$BW_BIN" status 2>/dev/null | tail -n 1
+}
+
+bw_login_state() {
+  bw_status_json | json -r '.status // "unknown"' 2>/dev/null || printf 'unknown'
+}
+
+# Called by each vault command AFTER it has validated its own arguments, so a
+# usage mistake reports a usage error rather than a login error. Must be invoked
+# from the main process: a `die` inside a command substitution would only kill
+# that subshell and let execution continue.
+need_vault() { require_login; }
+
+require_login() {
+  local st; st="$(bw_login_state)"
+  if [ "$st" = "unauthenticated" ]; then
+    die "você não está logado no Bitwarden. Rode em um terminal seu:  bw login   (ou: bwcc login)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# unlocking
+# ---------------------------------------------------------------------------
+
+# Desktop-app biometric unlock. The official CLI (>= 2026.10) tries the
+# Bitwarden desktop app when `bw unlock` runs interactively with no password,
+# so we hand it a pty — Claude Code's shell has no tty of its own.
+unlock_with_biometrics() {
+  local tmp key rc=0
+  tmp="$(mktemp "${TMPDIR:-/tmp}/bwcc.XXXXXX")"
+  run_with_timeout "$UNLOCK_TIMEOUT" \
+    script -q /dev/null "$BW_BIN" unlock --raw >"$tmp" 2>/dev/null </dev/null || rc=$?
+  key="$(extract_session <"$tmp")"
+  rm -f "$tmp"
+  [ -n "$key" ] || return 1
+  printf '%s' "$key"
+}
+
+# Fallback: ask for the master password in a native macOS dialog. The password
+# is handed to `bw` through a one-shot environment variable, never as an
+# argument (argv is visible to other processes) and never through this script's
+# stdout.
+unlock_with_password() {
+  local pw key var
+  pw="$(osascript \
+        -e 'display dialog "Senha mestra do Bitwarden" with title "bwcc — desbloquear cofre" default answer "" with hidden answer buttons {"Cancelar","Desbloquear"} default button "Desbloquear" with icon caution' \
+        -e 'text returned of result' 2>/dev/null)" || return 1
+  [ -n "$pw" ] || return 1
+  var="BWCC_PW_$$"
+  export "$var=$pw"
+  pw=""
+  key="$("$BW_BIN" unlock --passwordenv "$var" --raw 2>/dev/null)" || { unset "$var"; return 1; }
+  unset "$var"
+  [ -n "$key" ] || return 1
+  printf '%s' "$key"
+}
+
+do_unlock() {
+  local key=""
+  if [ "$USE_BIOMETRICS" = "1" ]; then
+    key="$(unlock_with_biometrics || true)"
+  fi
+  if [ -z "$key" ]; then
+    [ "$USE_BIOMETRICS" = "1" ] && warn "biometria indisponível — caindo para a senha mestra"
+    key="$(unlock_with_password || true)"
+  fi
+  [ -n "$key" ] || die "não consegui desbloquear o cofre (biometria e senha falharam ou foram canceladas)"
+  printf '%s' "$key"
+}
+
+ensure_session() {
+  if [ -n "${BW_SESSION:-}" ]; then printf '%s' "$BW_SESSION"; return 0; fi
+  local s
+  s="$(session_get)"
+  if [ -n "$s" ]; then
+    session_put "$s"   # sliding window
+    printf '%s' "$s"
+    return 0
+  fi
+  s="$(do_unlock)"
+  session_put "$s"
+  printf '%s' "$s"
+}
+
+# Run `bw` with the session passed via environment (never argv). Retries once
+# after a fresh unlock when the vault turns out to be locked.
+bw_call() {
+  local sess out rc=0
+  sess="$(ensure_session)" || exit 1
+  [ -n "$sess" ] || die "sem sessão válida do Bitwarden"
+  set +e
+  out="$(BW_SESSION="$sess" "$BW_BIN" "$@" 2>&1)"; rc=$?
+  set -e
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qiE 'locked|invalid session|session key|more than one'; then
+    if printf '%s' "$out" | grep -qiE 'locked|invalid session|session key'; then
+      session_clear
+      sess="$(ensure_session)"
+      set +e
+      out="$(BW_SESSION="$sess" "$BW_BIN" "$@" 2>&1)"; rc=$?
+      set -e
+    fi
+  fi
+  printf '%s' "$out"
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# items and fields
+# ---------------------------------------------------------------------------
+is_uuid() {
+  printf '%s' "$1" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+}
+
+# Resolve a query (id, exact name, or search term) to exactly one item's JSON.
+# Ambiguity is an error that lists the candidates — never a silent guess.
+item_json() {
+  local q="$1" items exact n
+  if is_uuid "$q"; then bw_call get item "$q"; return; fi
+  items="$(bw_call list items --search "$q")" || die "falha ao buscar itens: $items"
+  exact="$(printf '%s' "$items" | json --arg q "$q" \
+    '[.[] | select(((.name // "") | ascii_downcase) == (($q) | ascii_downcase))]')"
+  if [ "$(printf '%s' "$exact" | json 'length')" = "1" ]; then
+    printf '%s' "$exact" | json '.[0]'
+    return
+  fi
+  n="$(printf '%s' "$items" | json 'length')"
+  case "$n" in
+    0) die "nenhum item encontrado para \"$q\"" ;;
+    1) printf '%s' "$items" | json '.[0]' ;;
+    *)
+      printf 'bwcc: %s itens casam com "%s". Use o nome exato ou o id:\n' "$n" "$q" >&2
+      printf '%s' "$items" | json -r '.[] | "  \(.id)  \(.name)  [\(.login.username // "-")]"' >&2
+      exit 2
+      ;;
+  esac
+}
+
+# field classification: secret fields are masked by default
+field_is_secret() {
+  local it="$1" f="$2" t
+  case "$f" in
+    password|notes|totp) return 0 ;;
+    username|user|uri|url|name|folder|id) return 1 ;;
+  esac
+  t="$(printf '%s' "$it" | json -r --arg f "$f" '((.fields // [])[] | select(.name == $f) | .type) // empty')"
+  [ "$t" = "1" ]   # Bitwarden field type 1 == hidden
+}
+
+item_field() {
+  local it="$1" f="$2" v
+  case "$f" in
+    password) v="$(printf '%s' "$it" | json -r '.login.password // empty')" ;;
+    username|user) v="$(printf '%s' "$it" | json -r '.login.username // empty')" ;;
+    notes) v="$(printf '%s' "$it" | json -r '.notes // empty')" ;;
+    uri|url) v="$(printf '%s' "$it" | json -r '(.login.uris // [])[0].uri // empty')" ;;
+    name) v="$(printf '%s' "$it" | json -r '.name // empty')" ;;
+    id) v="$(printf '%s' "$it" | json -r '.id // empty')" ;;
+    totp)
+      local id; id="$(printf '%s' "$it" | json -r '.id')"
+      v="$(bw_call get totp "$id")" || die "este item não tem TOTP configurado"
+      ;;
+    *)
+      v="$(printf '%s' "$it" | json -r --arg f "$f" '((.fields // [])[] | select(.name == $f) | .value) // empty')"
+      ;;
+  esac
+  [ -n "$v" ] || die "campo \"$f\" vazio ou inexistente nesse item (veja: bwcc fields <item>)"
+  printf '%s' "$v"
+}
+
+# bw://<item>/<field>  ->  "<item>\t<field>"   (field defaults to password)
+split_ref() {
+  local ref="$1" q f
+  case "$ref" in
+    bw://*) ref="${ref#bw://}" ;;
+    *) die "referência inválida (esperado bw://item/campo): $ref" ;;
+  esac
+  [ -n "$ref" ] || die "referência vazia"
+  case "$ref" in
+    */*) q="${ref%%/*}"; f="${ref#*/}" ;;
+    *)   q="$ref"; f="password" ;;
+  esac
+  [ -n "$q" ] || die "referência sem item: bw://$ref"
+  [ -n "$f" ] || f="password"
+  printf '%s\t%s' "$q" "$f"
+}
+
+resolve_ref() {
+  local parts q f it
+  parts="$(split_ref "$1")" || exit 1
+  q="${parts%%	*}"; f="${parts##*	}"
+  it="$(item_json "$q")"
+  item_field "$it" "$f"
+}
+
+# ---------------------------------------------------------------------------
+# commands — read
+# ---------------------------------------------------------------------------
+cmd_status() {
+  local st sj
+  sj="$(bw_status_json)"
+  st="$(printf '%s' "$sj" | json -r '.status // "unknown"')"
+  info "bwcc           $BWCC_VERSION"
+  info "bw CLI         $("$BW_BIN" --version 2>/dev/null) ($BW_BIN)"
+  info "app desktop    $(desktop_version)"
+  info "conta          $(printf '%s' "$sj" | json -r '.userEmail // "-"')"
+  info "servidor       $(printf '%s' "$sj" | json -r '.serverUrl // "bitwarden.com (padrão)"')"
+  info "estado         $st"
+  info "último sync    $(printf '%s' "$sj" | json -r '.lastSync // "-"')"
+  info "sessão em cache $( [ -n "$(session_get)" ] && printf 'sim (expira em %s)' "$(session_remaining)" || printf 'não' )"
+  info "store          $SESSION_STORE   TTL ${SESSION_TTL}s   reveal=$REVEAL_POLICY"
+}
+
+desktop_version() {
+  local p="$DESKTOP_APP/Contents/Info.plist"
+  if [ -f "$p" ]; then
+    /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$p" 2>/dev/null || printf 'desconhecida'
+  else
+    printf 'não instalado'
+  fi
+}
+
+cmd_doctor() {
+  local ok=0 fail=0
+  check() { # $1 label, $2 result(0/1), $3 detail
+    if [ "$2" -eq 0 ]; then printf '  ✓ %-34s %s\n' "$1" "$3"; ok=$((ok+1));
+    else printf '  ✗ %-34s %s\n' "$1" "$3"; fail=$((fail+1)); fi
+  }
+  info "bwcc doctor"
+  info ""
+
+  check "macOS" "$( [ "$(uname -s)" = "Darwin" ] && echo 0 || echo 1 )" "$(uname -sr)"
+  check "bash >= 3.2" 0 "${BASH_VERSION:-?}"
+  check "jq" "$(have jq && echo 0 || echo 1)" "$(have jq && jq --version || echo 'instale: brew install jq')"
+  check "CLI bw" "$( [ -n "$BW_BIN" ] && echo 0 || echo 1 )" "${BW_BIN:-não encontrado} $("$BW_BIN" --version 2>/dev/null || true)"
+
+  local dv; dv="$(desktop_version)"
+  check "app Bitwarden desktop" "$( [ "$dv" != "não instalado" ] && echo 0 || echo 1 )" "$dv (biometria do CLI exige >= 2026.9.0)"
+
+  local proxy="$DESKTOP_APP/Contents/MacOS/desktop_proxy"
+  check "desktop_proxy (ponte IPC)" "$( [ -x "$proxy" ] && echo 0 || echo 1 )" "$( [ -x "$proxy" ] && echo "$proxy" || echo 'ausente' )"
+
+  local st; st="$(bw_login_state)"
+  check "login" "$( [ "$st" != "unauthenticated" ] && echo 0 || echo 1 )" "$st"
+
+  local kc=1
+  if security add-generic-password -a "$KC_ACCOUNT" -s "${KC_SERVICE}-probe" -w probe -U >/dev/null 2>&1; then
+    [ "$(security find-generic-password -a "$KC_ACCOUNT" -s "${KC_SERVICE}-probe" -w 2>/dev/null)" = "probe" ] && kc=0
+    security delete-generic-password -a "$KC_ACCOUNT" -s "${KC_SERVICE}-probe" >/dev/null 2>&1 || true
+  fi
+  check "Keychain (gravar/ler)" "$kc" "serviço '$KC_SERVICE'"
+
+  check "pbcopy (modo --copy)" "$(have pbcopy && echo 0 || echo 1)" ""
+  check "osascript (senha mestra)" "$(have osascript && echo 0 || echo 1)" ""
+  check "script(1) (pty p/ biometria)" "$(have script && echo 0 || echo 1)" ""
+
+  info ""
+  info "$ok ok, $fail com problema"
+  [ "$fail" -eq 0 ] || return 1
+}
+
+cmd_list() {
+  local q="${1:-}" items
+  need_vault
+  if [ -n "$q" ]; then items="$(bw_call list items --search "$q")"; else items="$(bw_call list items)"; fi
+  printf '%s' "$items" | json -r '
+    (["NOME","USUÁRIO","URI","ID"] | @tsv),
+    (.[] | [ (.name // "-"),
+             (.login.username // "-"),
+             (((.login.uris // [])[0].uri // "-") | sub("^https?://";"") | sub("/.*$";"")),
+             .id ] | @tsv)' \
+    | { if have column; then column -t -s "$(printf '\t')"; else cat; fi; }
+}
+
+cmd_fields() {
+  [ $# -ge 1 ] || die "uso: bwcc fields <item>"
+  need_vault
+  local it; it="$(item_json "$1")"
+  printf '%s' "$it" | json -r '
+    "item:     \(.name)",
+    "id:       \(.id)",
+    "tipo:     \(if .type == 1 then "login" elif .type == 2 then "nota segura" elif .type == 3 then "cartão" elif .type == 4 then "identidade" else "outro" end)",
+    "campos:   " + ([
+        (if (.login.username // "") != "" then "username" else empty end),
+        (if (.login.password // "") != "" then "password (secreto)" else empty end),
+        (if (.login.totp // "") != "" then "totp (secreto)" else empty end),
+        (if (.notes // "") != "" then "notes (secreto)" else empty end),
+        (if ((.login.uris // []) | length) > 0 then "uri" else empty end),
+        ((.fields // [])[] | .name + (if .type == 1 then " (secreto)" else "" end))
+      ] | join(", "))'
+}
+
+cmd_get() {
+  [ $# -ge 1 ] || die "uso: bwcc get <item> [campo] [--copy|--reveal]"
+  local q="$1" f="${2:-password}" it v
+  need_vault
+  it="$(item_json "$q")"
+  v="$(item_field "$it" "$f")"
+  if field_is_secret "$it" "$f"; then
+    emit_secret "$v" "$f"
+  else
+    printf '%s\n' "$v"
+  fi
+}
+
+cmd_copy() {
+  OPT_OUTPUT=copy
+  cmd_get "$@"
+}
+
+cmd_totp() {
+  [ $# -ge 1 ] || die "uso: bwcc totp <item>"
+  local it v
+  need_vault; it="$(item_json "$1")"
+  v="$(item_field "$it" totp)"
+  # TOTP codes live ~30s; printing one is far less exposure than a password,
+  # but it is still a credential, so the same output policy applies.
+  emit_secret "$v" "código TOTP"
+}
+
+# ---------------------------------------------------------------------------
+# commands — secrets without disclosure
+# ---------------------------------------------------------------------------
+
+# bwcc run [-e FILE] -- <command...>
+# Any exported variable whose value is a bw:// reference is resolved and handed
+# to the child process. Secrets go into the child's environment only; they are
+# never written to stdout, so they never land in a terminal log or AI transcript.
+cmd_run() {
+  local envfile="" ; local -a child=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -e|--env-file) envfile="${2:-}"; shift 2 ;;
+      --) shift; child=("$@"); break ;;
+      *) child=("$@"); break ;;
+    esac
+  done
+  [ "${#child[@]}" -gt 0 ] || die "uso: bwcc run [-e arquivo.env] -- <comando>"
+  need_vault
+
+  if [ -n "$envfile" ]; then
+    [ -f "$envfile" ] || die "arquivo não encontrado: $envfile"
+    local line name value
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in ''|'#'*) continue ;; esac
+      name="${line%%=*}"; value="${line#*=}"
+      name="$(printf '%s' "$name" | tr -d '[:space:]')"
+      value="${value%\"}"; value="${value#\"}"
+      value="${value%\'}"; value="${value#\'}"
+      case "$value" in bw://*) value="$(resolve_ref "$value")" ;; esac
+      export "$name=$value"
+    done <"$envfile"
+  fi
+
+  local n v
+  for n in $(compgen -e); do
+    eval "v=\${$n}"
+    case "$v" in bw://*) export "$n=$(resolve_ref "$v")" ;; esac
+  done
+
+  exec "${child[@]}"
+}
+
+# bwcc inject -i template [-o output]
+# Replaces {{ bw://item/field }} placeholders. Writing to stdout requires
+# --stdout, so a careless call cannot dump secrets into a transcript.
+cmd_inject() {
+  local tpl="" out="" to_stdout=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -i|--in) tpl="${2:-}"; shift 2 ;;
+      -o|--out) out="${2:-}"; shift 2 ;;
+      --stdout) to_stdout=1; shift ;;
+      *) die "argumento desconhecido para inject: $1" ;;
+    esac
+  done
+  [ -n "$tpl" ] || die "uso: bwcc inject -i modelo.env -o .env"
+  [ -f "$tpl" ] || die "modelo não encontrado: $tpl"
+  [ -n "$out" ] || [ "$to_stdout" -eq 1 ] || die "informe -o <arquivo> (ou --stdout, que IMPRIME os segredos)"
+  need_vault
+
+  local content ref val guard=0
+  content="$(cat "$tpl")"
+  while [[ "$content" =~ \{\{[[:space:]]*(bw://[^}[:space:]]+)[[:space:]]*\}\} ]]; do
+    guard=$((guard+1)); [ "$guard" -le 200 ] || die "muitas substituições — modelo suspeito de recursão"
+    ref="${BASH_REMATCH[1]}"
+    val="$(resolve_ref "$ref")"
+    content="${content//"${BASH_REMATCH[0]}"/$val}"
+  done
+
+  if [ "$to_stdout" -eq 1 ]; then
+    printf '%s\n' "$content"
+  else
+    printf '%s\n' "$content" >"$out"
+    chmod 600 "$out"
+    info "escrito em $out (modo 600), $guard segredo(s) injetado(s) — nada foi exibido."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# commands — write
+# ---------------------------------------------------------------------------
+cmd_gen() {
+  # A freshly generated string is not vault data yet, so it is printed.
+  # To create an item without ever showing the password use: bwcc add --generate
+  local -a a=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --words) a+=(--passphrase); shift ;;
+      --length) a+=(--length "${2:-20}"); shift 2 ;;
+      *) a+=("$1"); shift ;;
+    esac
+  done
+  [ "${#a[@]}" -gt 0 ] || a=(--length 24 --uppercase --lowercase --number --special)
+  "$BW_BIN" generate "${a[@]}"
+}
+
+cmd_add() {
+  [ $# -ge 1 ] || die "uso: bwcc add <nome> [--username u] [--uri url] [--folder f] [--generate|--password-stdin] [--note texto]"
+  local name="$1"; shift
+  local user="" uri="" folder="" note="" pw="" mode=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --username|-u) user="${2:-}"; shift 2 ;;
+      --uri) uri="${2:-}"; shift 2 ;;
+      --folder) folder="${2:-}"; shift 2 ;;
+      --note) note="${2:-}"; shift 2 ;;
+      --generate) mode=gen; shift ;;
+      --password-stdin) mode=stdin; shift ;;
+      *) die "argumento desconhecido para add: $1" ;;
+    esac
+  done
+  case "$mode" in
+    gen) pw="$("$BW_BIN" generate --length 24 --uppercase --lowercase --number --special)" ;;
+    stdin) IFS= read -r pw ;;
+    *) die "escolha --generate ou --password-stdin (a senha nunca vai em argumento de linha de comando)" ;;
+  esac
+  [ -n "$pw" ] || die "senha vazia"
+  need_vault
+
+  local folder_id="null"
+  if [ -n "$folder" ]; then
+    folder_id="$(bw_call list folders --search "$folder" | json -r --arg f "$folder" \
+      'first(.[] | select(.name == $f) | .id) // empty')"
+    [ -n "$folder_id" ] || die "pasta \"$folder\" não existe no cofre"
+    folder_id="\"$folder_id\""
+  fi
+
+  local payload
+  payload="$(json -n --arg name "$name" --arg user "$user" --arg pw "$pw" \
+                  --arg uri "$uri" --arg note "$note" --argjson folderId "$folder_id" '
+    {
+      type: 1, name: $name, notes: (if $note == "" then null else $note end),
+      folderId: $folderId, organizationId: null, favorite: false,
+      login: {
+        username: (if $user == "" then null else $user end),
+        password: $pw,
+        totp: null,
+        uris: (if $uri == "" then [] else [{match: null, uri: $uri}] end)
+      }
+    }')"
+  pw=""
+
+  local sess out rc=0
+  sess="$(ensure_session)" || exit 1
+  [ -n "$sess" ] || die "sem sessão válida do Bitwarden"
+  set +e
+  out="$(printf '%s' "$payload" | BW_SESSION="$sess" "$BW_BIN" encode \
+         | BW_SESSION="$sess" "$BW_BIN" create item 2>&1)"; rc=$?
+  set -e
+  payload=""
+  [ "$rc" -eq 0 ] || die "falha ao criar o item: $out"
+  info "item criado: $(printf '%s' "$out" | json -r '.name // "?"')  id=$(printf '%s' "$out" | json -r '.id // "?"')"
+  info "a senha não foi exibida. Para usá-la: bwcc copy \"$name\""
+}
+
+# ---------------------------------------------------------------------------
+# commands — session lifecycle
+# ---------------------------------------------------------------------------
+cmd_unlock() {
+  need_vault
+  ensure_session >/dev/null
+  info "cofre desbloqueado; sessão em cache ($SESSION_STORE), expira em $(session_remaining)."
+}
+
+cmd_lock() {
+  local s; s="$(session_get)"
+  [ -n "$s" ] && BW_SESSION="$s" "$BW_BIN" lock >/dev/null 2>&1 || true
+  session_clear
+  info "cofre travado e sessão removida do cache."
+}
+
+cmd_logout() {
+  session_clear
+  "$BW_BIN" logout >/dev/null 2>&1 || true
+  info "logout concluído; sessão removida do cache."
+}
+
+cmd_login() {
+  if [ -t 0 ]; then
+    exec "$BW_BIN" login "$@"
+  fi
+  cat >&2 <<'MSG'
+bwcc: `bw login` precisa de um terminal interativo (e-mail, senha mestra e 2FA).
+Rode você mesmo, uma única vez:
+
+    bw login
+
+No Claude Code, dá pra rodar direto do prompt com o prefixo "!":
+
+    ! bw login
+
+Depois disso o bwcc cuida de desbloquear com Touch ID a cada sessão.
+MSG
+  exit 2
+}
+
+cmd_sync() { need_vault; bw_call sync >/dev/null && info "cofre sincronizado."; }
+
+cmd_resolve() {
+  [ $# -ge 1 ] || die "uso: bwcc resolve bw://item/campo"
+  local v
+  split_ref "$1" >/dev/null
+  need_vault; v="$(resolve_ref "$1")"
+  emit_secret "$v" "$1"
+}
+
+# ---------------------------------------------------------------------------
+# help and dispatch
+# ---------------------------------------------------------------------------
+usage() {
+  cat <<'USAGE'
+bwcc — Bitwarden para o Claude Code (macOS)
+
+USO
+  bwcc <comando> [argumentos]
+
+LEITURA (nunca imprime segredo sem você pedir)
+  status                      estado do CLI, do app desktop e da sessão
+  doctor                      diagnóstico da instalação
+  list [busca]                lista itens (nome, usuário, domínio, id)
+  fields <item>               mostra quais campos o item tem — sem valores
+  get <item> [campo]          lê um campo (padrão: password)
+  copy <item> [campo]         copia o valor pra área de transferência
+  totp <item>                 código TOTP do item
+  resolve bw://item/campo     resolve uma referência
+
+USAR SEGREDO SEM EXIBIR
+  run [-e arq.env] -- <cmd>   injeta refs bw:// no ambiente do comando filho
+  inject -i modelo -o saída   preenche {{ bw://item/campo }} em um arquivo
+
+ESCRITA
+  gen [--length N] [--words]  gera uma senha (imprime: ainda não é dado do cofre)
+  add <nome> [opções]         cria um login  (--generate | --password-stdin,
+                              --username, --uri, --folder, --note)
+
+SESSÃO
+  login                       bw login (precisa de terminal interativo)
+  unlock                      desbloqueia (Touch ID pelo app) e guarda a sessão
+  lock                        trava o cofre e apaga a sessão do cache
+  logout                      encerra a sessão da conta
+  sync                        sincroniza o cofre
+
+MODIFICADORES DE SAÍDA
+  --copy                      copia o segredo em vez de imprimir
+  --reveal                    imprime o segredo (vai pro histórico do terminal
+                              e, no Claude Code, pra transcrição do modelo)
+
+AMBIENTE
+  BWCC_SESSION_TTL=900        validade da sessão em cache (0 = sem expirar)
+  BWCC_SESSION_STORE=keychain keychain | file | none
+  BWCC_REVEAL=never           never | always (always = get imprime por padrão)
+  BWCC_BIOMETRICS=1           0 desliga a biometria e vai direto na senha mestra
+  BWCC_BW_BIN=/caminho/bw     CLI do Bitwarden em local não padrão
+
+EXEMPLOS
+  bwcc list github
+  bwcc copy "GitHub" password
+  bwcc run -- env | grep -c TOKEN
+  DATABASE_URL='bw://Supabase MGE/connection_string' bwcc run -- npm start
+  bwcc inject -i .env.tpl -o .env
+USAGE
+}
+
+main() {
+  require_bash
+  OPT_OUTPUT="mask"
+
+  # global flags that make sense before the subcommand
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) usage; exit 0 ;;
+      -v|--version) printf 'bwcc %s\n' "$BWCC_VERSION"; exit 0 ;;
+      *) break ;;
+    esac
+  done
+  [ $# -gt 0 ] || { usage; exit 0; }
+
+  local sub="$1"; shift
+
+  if [ "$sub" = "__test" ]; then
+    local fn="$1"; shift
+    "$fn" "$@"
+    return $?
+  fi
+
+  resolve_bw
+
+  # output modifiers are only meaningful for the reading commands; for `run`
+  # everything after the subcommand belongs to the child process.
+  case "$sub" in
+    get|copy|totp|resolve|fields|list)
+      local -a rest=()
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --reveal) OPT_OUTPUT="reveal"; shift ;;
+          --copy) OPT_OUTPUT="copy"; shift ;;
+          --) shift ;;
+          *) rest[${#rest[@]}]="$1"; shift ;;
+        esac
+      done
+      if [ "${#rest[@]}" -gt 0 ]; then set -- "${rest[@]}"; else set --; fi
+      ;;
+  esac
+
+  case "$sub" in
+    status)   cmd_status ;;
+    doctor)   cmd_doctor ;;
+    list|ls)  cmd_list "${1:-}" ;;
+    fields)   [ $# -ge 1 ] || die "uso: bwcc fields <item>"; cmd_fields "$1" ;;
+    get)      cmd_get "$@" ;;
+    copy)     cmd_copy "$@" ;;
+    totp)     cmd_totp "$@" ;;
+    resolve)  cmd_resolve "$@" ;;
+    run)      cmd_run "$@" ;;
+    inject)   cmd_inject "$@" ;;
+    gen|generate) cmd_gen "$@" ;;
+    add|create)   cmd_add "$@" ;;
+    login)    cmd_login "$@" ;;
+    unlock)   cmd_unlock ;;
+    lock)     cmd_lock ;;
+    logout)   cmd_logout ;;
+    sync)     cmd_sync ;;
+    help)     usage ;;
+    *)        die "comando desconhecido: $sub  (bwcc --help)" ;;
+  esac
+}
+
+main "$@"

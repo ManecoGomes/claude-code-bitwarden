@@ -1,0 +1,17 @@
+{
+  "name": "claude-code-bitwarden",
+  "description": "Acesso ao cofre do Bitwarden pelo Claude Code no macOS, com Touch ID pelo app desktop e segredos que não vazam na transcrição",
+  "owner": {
+    "name": "Maneco Gomes",
+    "url": "https://github.com/ManecoGomes"
+  },
+  "plugins": [
+    {
+      "name": "bitwarden",
+      "source": "./plugins/bitwarden",
+      "version": "0.1.0",
+      "category": "security",
+      "tags": ["bitwarden", "secrets", "password-manager", "macos", "touch-id", "vault"]
+    }
+  ]
+}

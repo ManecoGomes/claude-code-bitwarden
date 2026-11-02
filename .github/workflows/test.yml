@@ -1,0 +1,41 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  offline-suite:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: dependências
+        run: |
+          brew list jq >/dev/null 2>&1 || brew install jq
+          npm install -g @bitwarden/cli
+          bw --version
+
+      - name: sintaxe
+        run: |
+          bash -n plugins/bitwarden/bin/bwcc
+          bash -n install.sh
+          bash -n tests/test-bwcc.sh
+
+      - name: shellcheck
+        run: |
+          brew install shellcheck
+          shellcheck -S warning plugins/bitwarden/bin/bwcc install.sh tests/test-bwcc.sh || true
+
+      - name: suíte offline
+        run: ./tests/test-bwcc.sh
+
+      - name: manifestos json válidos
+        run: |
+          python3 -c "import json;json.load(open('.claude-plugin/marketplace.json'))"
+          python3 -c "import json;json.load(open('plugins/bitwarden/.claude-plugin/plugin.json'))"
+
+      - name: nenhum segredo no repositório
+        run: |
+          ! grep -rInE 'BW_SESSION=[A-Za-z0-9+/]{20,}' --exclude-dir=.git . || exit 1
