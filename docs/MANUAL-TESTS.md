@@ -29,6 +29,13 @@ Pré-requisito: `bwcc doctor` com tudo ✓ e `bw login` feito.
 | 19 | app desktop fechado, `bwcc unlock` | avisa "biometria indisponível" e cai na senha mestra |
 | 21 | `bwcc doctor \| grep biometrics` | reporta a flag como ligada/desligada/desconhecida, com explicação |
 | 22 | `BWCC_BIOMETRICS=force bwcc unlock` (flag `false`) | tenta a ponte IPC mesmo assim; espera até o timeout e cai na senha |
+| 23 | `bwcc doctor` em Mac sem sensor | linha `· sensor biométrico AUSENTE` **sem** contar como falha; a flag aparece como "irrelevante sem sensor" |
+| 24 | diálogo de senha mestra | mostra a conta e "Pedido por: bwcc (Claude Code)" |
+| 25 | `BWCC_SESSION_TTL=0`, desbloquear, reiniciar o Mac, rodar `bwcc list` | pede a senha de novo: a sessão não sobrevive ao restart (boot-time no payload) |
+| 26 | config com chave inventada | avisa `chave ignorada no config: X` e segue |
+| 27 | disparar desbloqueio com outra janela em foco | o diálogo nasce **na frente** (sem o `activate` ele abre atrás e você espera um prompt invisível) |
+| 28 | abrir o diálogo e não responder | desiste em `BWCC_UNLOCK_TIMEOUT` (120s) com "sem resposta", em vez de pendurar o comando |
+| 29 | cancelar o diálogo, depois `security find-generic-password -s bwcc-session -w` | **nada** no Keychain: falha de desbloqueio não grava sessão vazia |
 | 20 | `security find-generic-password -s bwcc-session -w` | devolve `<timestamp>:<chave>` — confirma onde a sessão mora |
 
 Limpeza: `bwcc lock` e apague o item `teste-bwcc` no app.

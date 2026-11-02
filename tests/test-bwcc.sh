@@ -32,7 +32,7 @@ ITEM='{"id":"3f1a","name":"GitHub","type":1,
 echo "bwcc — testes offline"
 echo
 echo "superfície do CLI"
-eq "--version imprime a versão" "bwcc 0.1.1" "$("$BWCC" --version)"
+eq "--version imprime a versão" "bwcc 0.2.0" "$("$BWCC" --version)"
 contains "--help documenta o run" "bwcc run" "$("$BWCC" --help)"
 out="$("$BWCC" comando-que-nao-existe 2>&1)"; rc=$?
 eq   "comando inválido sai com erro" "1" "$rc"
@@ -99,6 +99,65 @@ eq "sem a flag -> desconhecida"      "desconhecida" "$(T biometrics_flag "$fx_no
 eq "arquivo inexistente -> desconhecida" "desconhecida" "$(T biometrics_flag /nao/existe)"
 eq "primeiro arquivo sem a flag, segundo com" "false" "$(T biometrics_flag "$fx_none" "$fx_false")"
 rm -f "$fx_false" "$fx_true" "$fx_none"
+
+echo
+echo "arquivo de config (precedência ambiente > arquivo > padrão)"
+cfg="$(mktemp)"
+cat >"$cfg" <<'C'
+# comentário ignorado
+BWCC_SESSION_TTL=1234
+BWCC_REVEAL=always
+BWCC_CHAVE_INVENTADA=xyz
+C
+eq "arquivo aplica TTL"        "1234" "$(BWCC_CONFIG="$cfg" T cfg_dump | cut -d'|' -f1)"
+eq "arquivo aplica reveal"     "always" "$(BWCC_CONFIG="$cfg" T cfg_dump | cut -d'|' -f3)"
+eq "ambiente vence o arquivo"  "60"   "$(BWCC_CONFIG="$cfg" BWCC_SESSION_TTL=60 T cfg_dump | cut -d'|' -f1)"
+eq "padrão quando nada define" "keychain" "$(BWCC_CONFIG="$cfg" T cfg_dump | cut -d'|' -f2)"
+contains "chave desconhecida é avisada" "chave ignorada" "$(BWCC_CONFIG="$cfg" T cfg_dump 2>&1 >/dev/null)"
+rm -f "$cfg"
+
+echo
+echo "sessão amarrada ao boot (política onRestart)"
+sdir="$(mktemp -d)"
+boot="$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/.*sec = \([0-9]*\).*/\1/p')"
+mkchave() { printf '%s:%s:CHAVE-TESTE' "$1" "$2" >"$sdir/session"; }
+mkchave "$(date +%s)" "$boot"
+eq "boot atual -> sessão válida"   "CHAVE-TESTE" "$(BWCC_SESSION_STORE=file BWCC_STATE_DIR="$sdir" T session_get)"
+mkchave "$(date +%s)" "1"
+eq "boot antigo -> sessão descartada" "" "$(BWCC_SESSION_STORE=file BWCC_STATE_DIR="$sdir" T session_get)"
+mkchave "$(( $(date +%s) - 5000 ))" "$boot"
+eq "TTL vencido -> descartada"     "" "$(BWCC_SESSION_STORE=file BWCC_STATE_DIR="$sdir" BWCC_SESSION_TTL=900 T session_get)"
+mkchave "$(( $(date +%s) - 5000 ))" "$boot"
+eq "TTL=0 ignora idade, exige boot" "CHAVE-TESTE" "$(BWCC_SESSION_STORE=file BWCC_STATE_DIR="$sdir" BWCC_SESSION_TTL=0 T session_get)"
+printf '%s:CHAVE-TESTE' "$(date +%s)" >"$sdir/session"
+eq "formato antigo (2 campos) -> descartado" "" "$(BWCC_SESSION_STORE=file BWCC_STATE_DIR="$sdir" T session_get)"
+rm -rf "$sdir"
+
+echo
+echo "sessão vazia nunca entra no cache (regressão: die em subshell)"
+sdir2="$(mktemp -d)"
+out="$(BWCC_SESSION_STORE=file BWCC_STATE_DIR="$sdir2" T session_put "" 2>&1)"; rc=$?
+eq       "session_put com vazio falha"   "1" "$rc"
+contains "e avisa o motivo" "recusando gravar sessão vazia" "$out"
+eq       "e não escreve arquivo nenhum"  "0" "$(ls -1 "$sdir2" 2>/dev/null | wc -l | tr -d ' ')"
+out="$(BWCC_SESSION_STORE=file BWCC_STATE_DIR="$sdir2" T session_put "CHAVE-OK" 2>&1)"; rc=$?
+eq       "session_put com chave funciona" "0" "$rc"
+eq       "e o cache devolve a chave"      "CHAVE-OK" \
+         "$(BWCC_SESSION_STORE=file BWCC_STATE_DIR="$sdir2" T session_get)"
+rm -rf "$sdir2"
+
+echo
+echo "diálogo de senha tem prazo (regressão: comando pendurado 457s)"
+if grep -q 'giving up after \$UNLOCK_TIMEOUT' "$BWCC"; then
+  ok "osascript recebe 'giving up after'"
+else
+  bad "osascript recebe 'giving up after'" "presente" "ausente"
+fi
+
+echo
+echo "detecção de hardware biométrico"
+hw="$(T biometrics_hardware)"
+case "$hw" in sim|nao) ok "responde sim/nao (aqui: $hw)" ;; *) bad "responde sim/nao" "sim|nao" "$hw" ;; esac
 
 echo
 echo "guardas do inject"

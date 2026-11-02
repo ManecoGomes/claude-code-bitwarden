@@ -83,10 +83,12 @@ pra remover ou alterar algo no cofre, diga que ele faz isso no app do Bitwarden.
 | Situação | O que fazer |
 |---|---|
 | `você não está logado` | Ele precisa rodar `bw login` uma vez **no Terminal.app ou iTerm**. Não tente logar por ele e **não use o prefixo `!`**: o CLI usa readline e morre com `ERR_USE_AFTER_CLOSE` sem tty próprio. Dá pra abrir o terminal pra ele: `osascript -e 'tell application "Terminal" to do script "bw login"'`. Quem não quer prompt usa `bw login --apikey` com `BW_CLIENTID`/`BW_CLIENTSECRET`. |
-| primeiro comando da sessão demora | É o Touch ID: o app desktop abriu o prompt. Normal. |
-| `biometria indisponível` | Abre um diálogo pedindo a senha mestra. Se o usuário não esperava, mande ele conferir se o app desktop está aberto e com biometria ligada, e rodar `bwcc doctor`. |
+| primeiro comando da sessão demora | É o desbloqueio: ou o prompt de Touch ID, ou o diálogo de senha mestra. Normal — avise que apareceu um diálogo na tela dele. |
+| `biometria indisponível` / sem Touch ID | Esperado em Mac sem sensor (mini/Studio) ou com a flag `biometrics-sdk-ipc` desligada pelo servidor. **Não** mande o usuário "ligar a biometria no app": rode `bwcc doctor` e leia o motivo real antes de orientar. |
 | algo esquisito na instalação | `bwcc doctor` diagnostica tudo (CLI, app, proxy IPC, Keychain, login). |
 | segredo mudou no cofre agora | `bwcc sync` antes de ler. |
 
-A sessão fica em cache por 15 minutos de uso (TTL deslizante), então uma
-sequência de comandos pede Touch ID uma vez só. `bwcc lock` encerra na hora.
+A sessão fica em cache (padrão: 15 min de TTL deslizante; se o usuário puser
+`BWCC_SESSION_TTL=0` em `~/.config/bwcc/config`, vale até reiniciar o Mac).
+Então uma sequência de comandos só desbloqueia uma vez. `bwcc lock` encerra na
+hora. A sessão nunca sobrevive a um restart.

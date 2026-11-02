@@ -16,11 +16,34 @@
 set -euo pipefail
 umask 077
 
-BWCC_VERSION="0.1.1"
+BWCC_VERSION="0.2.0"
 
 # ---------------------------------------------------------------------------
-# configuration (all overridable by environment)
+# configuration
+#
+# Precedência: ambiente > arquivo de config > padrão. O arquivo é *lido*,
+# nunca executado (`source` num arquivo de config de ferramenta que toca cofre
+# é execução de código arbitrário), e só chaves conhecidas são aceitas.
 # ---------------------------------------------------------------------------
+BWCC_CONFIG="${BWCC_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/bwcc/config}"
+if [ -f "$BWCC_CONFIG" ]; then
+  while IFS= read -r __line || [ -n "$__line" ]; do
+    case "$__line" in ''|'#'*) continue ;; esac
+    __k="${__line%%=*}"; __v="${__line#*=}"
+    __k="$(printf '%s' "$__k" | tr -d '[:space:]')"
+    __v="${__v#"${__v%%[![:space:]]*}"}"; __v="${__v%"${__v##*[![:space:]]}"}"
+    __v="${__v%\"}"; __v="${__v#\"}"; __v="${__v%\'}"; __v="${__v#\'}"
+    case "$__k" in
+      BWCC_SESSION_TTL|BWCC_SESSION_STORE|BWCC_REVEAL|BWCC_BIOMETRICS|\
+      BWCC_UNLOCK_TIMEOUT|BWCC_BW_BIN|BWCC_KEYCHAIN_SERVICE|\
+      BWCC_KEYCHAIN_ACCOUNT|BWCC_STATE_DIR|BWCC_DESKTOP_APP)
+        eval "[ -n \"\${$__k:-}\" ] || $__k=\"\$__v\"" ;;
+      *) printf 'bwcc: chave ignorada no config: %s\n' "$__k" >&2 ;;
+    esac
+  done <"$BWCC_CONFIG"
+  unset __line __k __v
+fi
+
 BW_BIN="${BWCC_BW_BIN:-}"
 SESSION_TTL="${BWCC_SESSION_TTL:-900}"            # seconds; 0 = no expiry
 SESSION_STORE="${BWCC_SESSION_STORE:-keychain}"   # keychain | file
@@ -29,7 +52,7 @@ KC_ACCOUNT="${BWCC_KEYCHAIN_ACCOUNT:-${USER:-bwcc}}"
 STATE_DIR="${BWCC_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/bwcc}"
 REVEAL_POLICY="${BWCC_REVEAL:-never}"             # never | always
 USE_BIOMETRICS="${BWCC_BIOMETRICS:-1}"
-UNLOCK_TIMEOUT="${BWCC_UNLOCK_TIMEOUT:-90}"
+UNLOCK_TIMEOUT="${BWCC_UNLOCK_TIMEOUT:-120}"
 DESKTOP_APP="${BWCC_DESKTOP_APP:-/Applications/Bitwarden.app}"
 
 # ---------------------------------------------------------------------------
@@ -122,11 +145,23 @@ json() {
 }
 
 # ---------------------------------------------------------------------------
-# session cache  (payload format: "<unix-ts>:<session-key>")
+# session cache  (payload: "<unix-ts>:<boot-time>:<session-key>")
+#
+# O boot-time entra no payload para a sessão NÃO sobreviver a um restart — é a
+# mesma política que o app do Bitwarden chama de "onRestart". Com isso,
+# BWCC_SESSION_TTL=0 significa "vale até reiniciar ou travar", não "para sempre".
 # ---------------------------------------------------------------------------
+boot_id() {
+  sysctl -n kern.boottime 2>/dev/null | sed -n 's/.*sec = \([0-9]*\).*/\1/p'
+}
+
 session_put() {
   local payload
-  payload="$(date +%s):$1"
+  if [ -z "${1:-}" ]; then
+    warn "recusando gravar sessão vazia no cache"
+    return 1
+  fi
+  payload="$(date +%s):$(boot_id):$1"
   case "$SESSION_STORE" in
     keychain)
       security add-generic-password -a "$KC_ACCOUNT" -s "$KC_SERVICE" \
@@ -160,12 +195,15 @@ session_clear() {
 
 # echoes the cached key if still within TTL, nothing otherwise
 session_get() {
-  local payload ts key now
+  local payload ts boot key rest now
   payload="$(session_raw)"
   [ -n "$payload" ] || return 0
-  ts="${payload%%:*}"; key="${payload#*:}"
+  ts="${payload%%:*}"; rest="${payload#*:}"
+  boot="${rest%%:*}"; key="${rest#*:}"
   case "$ts" in ''|*[!0-9]*) session_clear; return 0 ;; esac
+  case "$boot" in ''|*[!0-9]*) session_clear; return 0 ;; esac   # formato antigo
   [ -n "$key" ] || { session_clear; return 0; }
+  if [ "$boot" != "$(boot_id)" ]; then session_clear; return 0; fi
   if [ "$SESSION_TTL" -gt 0 ]; then
     now="$(date +%s)"
     if [ "$(( now - ts ))" -ge "$SESSION_TTL" ]; then session_clear; return 0; fi
@@ -180,7 +218,7 @@ session_remaining() {
   [ -n "$payload" ] || { printf '%s' "-"; return; }
   ts="${payload%%:*}"
   case "$ts" in ''|*[!0-9]*) printf '%s' "-"; return ;; esac
-  [ "$SESSION_TTL" -gt 0 ] || { printf '%s' "sem expiração"; return; }
+  [ "$SESSION_TTL" -gt 0 ] || { printf '%s' "até reiniciar o Mac"; return; }
   now="$(date +%s)"
   local left=$(( SESSION_TTL - (now - ts) ))
   if [ "$left" -le 0 ]; then printf '%s' "expirada"; else printf '%ds' "$left"; fi
@@ -230,11 +268,23 @@ unlock_with_biometrics() {
 # argument (argv is visible to other processes) and never through this script's
 # stdout.
 unlock_with_password() {
-  local pw key var
+  local pw key var acct prompt
+  # Identificar a conta no diálogo: um agente pode disparar este prompt, e você
+  # tem que conseguir ver de onde ele veio antes de digitar a senha mestra.
+  acct="$(bw_status_json | json -r '.userEmail // empty' 2>/dev/null || true)"
+  prompt="Senha mestra do Bitwarden"
+  [ -n "$acct" ] && prompt="$prompt\n\nConta: $acct\nPedido por: bwcc (Claude Code)"
+  # `activate` antes do diálogo é obrigatório: disparado por um agente, o
+  # processo não está em primeiro plano e a janela nasce ATRÁS de tudo — você
+  # fica esperando um prompt que não vê. Verificado na prática.
   pw="$(osascript \
-        -e 'display dialog "Senha mestra do Bitwarden" with title "bwcc — desbloquear cofre" default answer "" with hidden answer buttons {"Cancelar","Desbloquear"} default button "Desbloquear" with icon caution' \
+        -e 'activate' \
+        -e "display dialog \"$prompt\" with title \"bwcc — desbloquear cofre\" default answer \"\" with hidden answer buttons {\"Cancelar\",\"Desbloquear\"} default button \"Desbloquear\" with icon caution giving up after $UNLOCK_TIMEOUT" \
         -e 'text returned of result' 2>/dev/null)" || return 1
-  [ -n "$pw" ] || return 1
+  if [ -z "$pw" ]; then
+    warn "desbloqueio cancelado, ou sem resposta em ${UNLOCK_TIMEOUT}s"
+    return 1
+  fi
   var="BWCC_PW_$$"
   export "$var=$pw"
   pw=""
@@ -245,18 +295,21 @@ unlock_with_password() {
 }
 
 do_unlock() {
-  local key="" flag try_bio=0
+  local key="" flag hw try_bio=0
+  hw="$(biometrics_hardware)"
   flag="$(biometrics_flag)"
   case "$USE_BIOMETRICS" in
     0)     try_bio=0 ;;
     force) try_bio=1 ;;
-    *)     [ "$flag" = "false" ] || try_bio=1 ;;
+    *)     [ "$hw" = "nao" ] || [ "$flag" = "false" ] || try_bio=1 ;;
   esac
 
   [ "$try_bio" -eq 1 ] && key="$(unlock_with_biometrics || true)"
 
   if [ -z "$key" ]; then
-    if [ "$USE_BIOMETRICS" != "0" ]; then
+    # Máquina sem sensor é estado permanente: avisar a cada desbloqueio seria
+    # só ruído. O diálogo de senha já se identifica. `bwcc doctor` explica.
+    if [ "$USE_BIOMETRICS" != "0" ] && [ "$hw" = "sim" ]; then
       if [ "$flag" = "false" ]; then
         warn "Touch ID indisponível: a flag 'biometrics-sdk-ipc' está desligada no servidor"
         warn "da Bitwarden para esta conta. Nada a fazer localmente — usando a senha mestra."
@@ -267,7 +320,10 @@ do_unlock() {
     fi
     key="$(unlock_with_password || true)"
   fi
-  [ -n "$key" ] || die "não consegui desbloquear o cofre (biometria e senha falharam ou foram canceladas)"
+  if [ -z "$key" ]; then
+    warn "não consegui desbloquear o cofre"
+    return 1
+  fi
   printf '%s' "$key"
 }
 
@@ -280,8 +336,11 @@ ensure_session() {
     printf '%s' "$s"
     return 0
   fi
-  s="$(do_unlock)"
-  session_put "$s"
+  # `do_unlock` roda em subshell: sem checar o retorno E o conteúdo, uma falha
+  # virava string vazia gravada no Keychain como se fosse sessão válida.
+  s="$(do_unlock)" || return 1
+  [ -n "$s" ] || return 1
+  session_put "$s" || return 1
   printf '%s' "$s"
 }
 
@@ -421,13 +480,33 @@ cmd_status() {
   info "último sync    $(printf '%s' "$sj" | json -r '.lastSync // "-"')"
   info "sessão em cache $( [ -n "$(session_get)" ] && printf 'sim (expira em %s)' "$(session_remaining)" || printf 'não' )"
   info "store          $SESSION_STORE   TTL ${SESSION_TTL}s   reveal=$REVEAL_POLICY"
-  info "Touch ID       $( [ "$flag" = "true" ] && printf 'disponível' \
-                          || printf 'indisponível (flag biometrics-sdk-ipc=%s)' "$flag" )"
+  if [ "$(biometrics_hardware)" = "nao" ]; then
+    info "Touch ID       indisponível (este Mac não tem sensor biométrico)"
+  elif [ "$flag" = "true" ]; then
+    info "Touch ID       disponível"
+  else
+    info "Touch ID       indisponível (flag biometrics-sdk-ipc=$flag)"
+  fi
 }
 
 # A biometria do CLI é gateada pela flag `biometrics-sdk-ipc`, que vem do
 # servidor da Bitwarden. Com ela desligada o CLI nem inicia o desktop_proxy,
 # então tentar é só perder tempo. O estado fica no cache de config local.
+# Um Mac mini / Mac Studio não tem sensor nenhum, e nenhuma flag muda isso.
+# O sensor aparece no IORegistry; um Magic Keyboard com Touch ID aparece no
+# barramento USB. `bioutil -r` NÃO serve: reporta a preferência do usuário e
+# responde "Biometrics for unlock: 1" até em máquina sem sensor.
+# usado pelos testes: config efetiva depois de ambiente > arquivo > padrão
+cfg_dump() { printf '%s|%s|%s|%s' "$SESSION_TTL" "$SESSION_STORE" "$REVEAL_POLICY" "$USE_BIOMETRICS"; }
+
+biometrics_hardware() {
+  if [ "$(ioreg -c AppleBiometricSensor 2>/dev/null | grep -c AppleBiometricSensor)" -gt 0 ]; then
+    printf 'sim'; return
+  fi
+  if ioreg -p IOUSB 2>/dev/null | grep -qi "touch id"; then printf 'sim'; return; fi
+  printf 'nao'
+}
+
 biometrics_flag() {
   local f v
   if [ $# -gt 0 ]; then set -- "$@"; else
@@ -457,10 +536,19 @@ desktop_version() {
 
 cmd_doctor() {
   local ok=0 fail=0
-  check() { # $1 label, $2 result(0/1), $3 detail
-    if [ "$2" -eq 0 ]; then printf '  ✓ %-34s %s\n' "$1" "$3"; ok=$((ok+1));
-    else printf '  ✗ %-34s %s\n' "$1" "$3"; fail=$((fail+1)); fi
+  # %-34s conta BYTES, e rótulo com acento ocupa menos colunas do que bytes —
+  # o alinhamento sai torto. ${#var} conta caracteres, então padding na mão.
+  pad() {
+    local l="$1" n=$(( 34 - ${#1} ))
+    printf '%s' "$l"
+    while [ "$n" -gt 0 ]; do printf ' '; n=$(( n - 1 )); done
   }
+  check() { # $1 label, $2 result(0/1), $3 detail
+    if [ "$2" -eq 0 ]; then printf '  ✓ %s %s\n' "$(pad "$1")" "$3"; ok=$((ok+1));
+    else printf '  ✗ %s %s\n' "$(pad "$1")" "$3"; fail=$((fail+1)); fi
+  }
+  # Fato da máquina, não defeito: não entra na contagem de falhas.
+  note() { printf '  · %s %s\n' "$(pad "$1")" "$2"; }
   info "bwcc doctor"
   info ""
 
@@ -475,15 +563,23 @@ cmd_doctor() {
   local proxy="$DESKTOP_APP/Contents/MacOS/desktop_proxy"
   check "desktop_proxy (ponte IPC)" "$( [ -x "$proxy" ] && echo 0 || echo 1 )" "$( [ -x "$proxy" ] && echo "$proxy" || echo 'ausente' )"
 
-  local bf; bf="$(biometrics_flag)"
-  if [ "$bf" = "true" ]; then
-    check "flag biometrics-sdk-ipc" 0 "ligada — Touch ID pelo app desktop disponível"
-  elif [ "$bf" = "false" ]; then
-    check "flag biometrics-sdk-ipc" 1 "DESLIGADA pelo servidor da Bitwarden: o CLI não inicia o"
-    printf '    %s\n' "desktop_proxy, então não há Touch ID. O bwcc usa a senha mestra."
-    printf '    %s\n' "Não é configuração local — é rollout da Bitwarden. Tente: BWCC_BIOMETRICS=force"
+  local hw bf; hw="$(biometrics_hardware)"; bf="$(biometrics_flag)"
+  if [ "$hw" = "nao" ]; then
+    note "sensor biométrico" "AUSENTE neste Mac ($(sysctl -n hw.model 2>/dev/null))"
+    printf '    %s\n' "Mac mini/Studio não tem Touch ID. O desbloqueio é por senha mestra, uma vez"
+    printf '    %s\n' "por janela de sessão. Único caminho de Touch ID aqui: Magic Keyboard com Touch ID."
+    note "flag biometrics-sdk-ipc" "$bf (irrelevante sem sensor)"
   else
-    check "flag biometrics-sdk-ipc" 1 "não consegui ler o cache de config (abra o app uma vez)"
+    check "sensor biométrico" 0 "presente"
+    if [ "$bf" = "true" ]; then
+      check "flag biometrics-sdk-ipc" 0 "ligada — Touch ID pelo app desktop disponível"
+    elif [ "$bf" = "false" ]; then
+      check "flag biometrics-sdk-ipc" 1 "DESLIGADA pelo servidor da Bitwarden: o CLI não inicia o"
+      printf '    %s\n' "desktop_proxy, então não há Touch ID. O bwcc usa a senha mestra."
+      printf '    %s\n' "Não é configuração local — é rollout da Bitwarden. Tente: BWCC_BIOMETRICS=force"
+    else
+      check "flag biometrics-sdk-ipc" 1 "não consegui ler o cache de config (abra o app uma vez)"
+    fi
   fi
 
   local st; st="$(bw_login_state)"
@@ -495,6 +591,9 @@ cmd_doctor() {
     security delete-generic-password -a "$KC_ACCOUNT" -s "${KC_SERVICE}-probe" >/dev/null 2>&1 || true
   fi
   check "Keychain (gravar/ler)" "$kc" "serviço '$KC_SERVICE'"
+
+  if [ -f "$BWCC_CONFIG" ]; then note "arquivo de config" "$BWCC_CONFIG"; fi
+  note "sessão" "store=$SESSION_STORE  TTL=$( [ "$SESSION_TTL" -gt 0 ] && printf '%ss' "$SESSION_TTL" || printf 'até reiniciar' )"
 
   check "pbcopy (modo --copy)" "$(have pbcopy && echo 0 || echo 1)" ""
   check "osascript (senha mestra)" "$(have osascript && echo 0 || echo 1)" ""
@@ -725,7 +824,7 @@ cmd_add() {
 # ---------------------------------------------------------------------------
 cmd_unlock() {
   need_vault
-  ensure_session >/dev/null
+  ensure_session >/dev/null || die "cofre segue travado"
   info "cofre desbloqueado; sessão em cache ($SESSION_STORE), expira em $(session_remaining)."
 }
 

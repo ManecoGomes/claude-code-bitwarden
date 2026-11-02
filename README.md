@@ -59,36 +59,49 @@ Faltavam três coisas para isso funcionar dentro do Claude Code:
 | `jq` | `brew install jq` (já vem no macOS 15+) |
 | bash | 3.2, o que já vem no sistema |
 
-## Estado do Touch ID hoje (leia antes de abrir issue)
+## Touch ID: leia antes de contar com ele
 
-O desbloqueio biométrico do CLI é gateado pela flag **`biometrics-sdk-ipc`**, que
-vem do **servidor** da Bitwarden. Com ela desligada, o CLI oficial nem inicia o
-`desktop_proxy` — então não existe Touch ID, por mais que o app esteja instalado,
-rodando e com biometria configurada.
+Duas coisas independentes precisam ser verdade, e nenhuma delas está no seu
+controle via este projeto. O `bwcc doctor` diz em qual você está.
 
-Em **2026-11-02**, numa conta pessoal em `bitwarden.com`, a flag estava `false`:
+**1. O Mac precisa ter sensor.** Mac mini e Mac Studio não têm — e nenhuma
+configuração muda isso. O único caminho ali é um **Magic Keyboard com Touch ID**.
+Não existe forma de usar o iPhone como sensor biométrico do Mac: a Apple não
+expõe isso (o Apple Watch aprova alguns prompts do sistema, mas não o
+`LocalAuthentication` que o Bitwarden usa). O `bwcc` detecta o sensor pelo
+IORegistry — e **não** por `bioutil -r`, que responde "Biometrics for unlock: 1"
+até em máquina sem sensor nenhum.
+
+**2. A flag `biometrics-sdk-ipc` precisa estar ligada.** Ela vem do *servidor*
+da Bitwarden. Desligada, o CLI oficial nem inicia o `desktop_proxy`: não há
+Touch ID por mais que o app esteja rodando e configurado. Em **2026-11-02**, numa
+conta pessoal em `bitwarden.com`, ela estava `false`. Não tem conserto local — é
+rollout da Bitwarden. Pra tentar de todo jeito: `BWCC_BIOMETRICS=force`.
+
+### O que você tem quando falta Touch ID
+
+Um **diálogo nativo de senha mestra** por janela de sessão, em vez de um por
+comando. O diálogo se identifica (conta e "pedido por: bwcc") justamente porque
+um agente pode disparar esse prompt — você precisa ver de onde ele veio antes de
+digitar.
+
+A janela é configurável, e o caso mais confortável é amarrar a sessão ao boot:
 
 ```bash
-$ bwcc doctor | grep -A1 biometrics
-  ✗ flag biometrics-sdk-ipc            DESLIGADA pelo servidor da Bitwarden: o CLI não inicia o
-    desktop_proxy, então não há Touch ID. O bwcc usa a senha mestra.
+# ~/.config/bwcc/config
+BWCC_SESSION_TTL=0      # vale até reiniciar o Mac, ou bwcc lock
 ```
 
-Isso **não é** configuração sua e não tem conserto local: é rollout da Bitwarden.
-O `bwcc` lida com isso de três formas:
+A sessão em cache carrega o `kern.boottime` no payload, então `0` **não** quer
+dizer "para sempre": ela morre no restart, igual à política `onRestart` do
+próprio app do Bitwarden. Com isso, a senha mestra é digitada uma vez por boot.
 
-1. **Detecta e explica** em vez de falhar com mensagem vaga (`bwcc doctor`, `bwcc status`).
-2. **Não insiste** — com a flag `false` ele pula a tentativa e vai direto pro
-   diálogo nativo de senha mestra, sem segundos perdidos esperando uma ponte IPC
-   que nunca vai subir.
-3. **Já está pronto pro dia em que a flag virar.** O caminho biométrico é o
-   mesmo código; quando a Bitwarden liberar, o Touch ID passa a funcionar sem
-   você mudar nada. Pra testar antes da hora: `BWCC_BIOMETRICS=force`.
+### Arquivo de config
 
-Com a flag desligada, o fluxo é: um diálogo de senha mestra por janela de 15
-minutos (em vez de um por comando), e a sessão fica no Keychain. Continua sendo
-muito melhor que `export BW_SESSION=...` na mão — mas não é Touch ID, e o README
-não vai fingir que é.
+`~/.config/bwcc/config` (ou `$BWCC_CONFIG`), uma chave por linha. Precedência:
+**ambiente > arquivo > padrão**. O arquivo é *lido*, nunca executado — `source`
+num config de ferramenta que toca cofre seria execução de código arbitrário — e
+chaves desconhecidas são recusadas com aviso.
 
 ## Instalação
 
@@ -191,20 +204,21 @@ bwcc sync      # sincroniza antes de ler algo que mudou agora
 
 | Variável | Padrão | O que faz |
 |---|---|---|
-| `BWCC_SESSION_TTL` | `900` | validade da sessão em cache, em segundos (`0` = não expira) |
+| `BWCC_SESSION_TTL` | `900` | validade da sessão em cache, em segundos (`0` = até reiniciar o Mac) |
 | `BWCC_SESSION_STORE` | `keychain` | `keychain`, `file` (0600 em `~/.local/state/bwcc`) ou `none` |
 | `BWCC_REVEAL` | `never` | `always` faz o `get` imprimir segredo por padrão |
 | `BWCC_BIOMETRICS` | `1` | `0` pula a biometria; `force` tenta mesmo com a flag de servidor desligada |
-| `BWCC_UNLOCK_TIMEOUT` | `90` | segundos de espera pelo Touch ID |
+| `BWCC_UNLOCK_TIMEOUT` | `120` | segundos de espera — vale pro Touch ID e pro diálogo de senha, que desiste sozinho em vez de pendurar o comando |
 | `BWCC_BW_BIN` | — | caminho do `bw` quando não está no `PATH` |
+| `BWCC_CONFIG` | `~/.config/bwcc/config` | arquivo de config alternativo |
 | `BWCC_KEYCHAIN_SERVICE` | `bwcc-session` | nome do item no Keychain |
 
 ## Comparação
 
 | | `op` (1Password) | **bwcc** | MCP oficial do Bitwarden |
 |---|---|---|---|
-| desbloqueio | app desktop + Touch ID | Touch ID quando a flag do servidor permite, senão diálogo de senha mestra | `BW_SESSION` fixo na config, ou diálogo de senha |
-| sessão entre comandos | gerenciada pelo app | Keychain, TTL deslizante | variável de ambiente estática |
+| desbloqueio | app desktop + Touch ID | Touch ID quando há sensor e a flag permite; senão diálogo de senha identificado | `BW_SESSION` fixo na config, ou diálogo de senha |
+| sessão entre comandos | gerenciada pelo app | Keychain, TTL deslizante, morre no restart | variável de ambiente estática |
 | segredo mascarado por padrão | não | **sim** | não |
 | injeção em processo/arquivo | `op run` / `op inject` | `bwcc run` / `bwcc inject` | não |
 | escrita no cofre | sim | criar item apenas | criar, editar e apagar |
@@ -232,7 +246,7 @@ que esta ferramenta **não** protege. Em resumo:
 ## Testes
 
 ```bash
-./tests/test-bwcc.sh       # 41 testes, offline, sem conta e sem rede
+./tests/test-bwcc.sh       # 58 testes, offline, sem conta e sem rede
 ```
 
 Os caminhos que exigem cofre de verdade (Touch ID, leitura, injeção) estão em
