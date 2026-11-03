@@ -200,6 +200,50 @@ bwcc lock      # trava e apaga a sessão do cache
 bwcc sync      # sincroniza antes de ler algo que mudou agora
 ```
 
+## Busca
+
+O `--search` do CLI oficial do Bitwarden olha só **nome, usuário e URI**, e é
+sensível a acento. Na prática isso quebra em português: um item `Avaliação` não
+aparece numa busca por `avaliacao`, e conteúdo guardado em **nota** ou **campo
+custom** é simplesmente invisível.
+
+O `bwcc` faz a busca localmente sobre o cofre inteiro:
+
+| | `bw --search` | `bwcc list` |
+|---|---|---|
+| nome, usuário, URI | sim | sim |
+| nota (`notes`) | **não** | sim |
+| nome e valor de campo custom | **não** | sim |
+| acento (`avaliacao` ↔ `Avaliação`) | **não** | sim |
+| caixa (`TESTE` ↔ `teste`) | sim | sim |
+| palavras fora de ordem (`claude teste`) | **não** | sim |
+
+Todos os termos precisam casar (E lógico), em qualquer parte e em qualquer ordem:
+
+```console
+$ bwcc list teste
+NOME                    USUÁRIO  URI  CASOU EM  ID
+BitWarden teste Claude  -        -    nome      b064d494-…
+teste do bitwarden      -        -    nome      ddfc3d55-…
+
+$ bwcc list "12 de janeiro"          # texto que existe só dentro da nota
+NOME                    USUÁRIO  URI  CASOU EM   ID
+BitWarden teste Claude  -        -    nome,nota  b064d494-…
+```
+
+A coluna **CASOU EM** diz em que parte o termo bateu (`nome`, `usuario`, `uri`,
+`nota`, `campos`) — sem nunca mostrar o valor dessa parte. Então dá pra achar um
+item pelo conteúdo secreto dele sem que o conteúdo apareça na tela.
+
+Em busca ambígua, `bwcc get` lista os candidatos com o `casou em` e sai com erro,
+em vez de escolher um. Nome exato (ignorando acento e caixa) sempre ganha de
+casamento parcial: `bwcc get GitHub` resolve pro item `GitHub`, não reclama de
+ambiguidade com `GitHub Enterprise`.
+
+**Custo:** a busca puxa o cofre inteiro numa chamada ao `bw` (~3s, dominado pela
+partida do Node). Não há cache em disco — guardar itens decifrados fora do
+Keychain seria escrever segredo em disco.
+
 ## Configuração
 
 | Variável | Padrão | O que faz |
@@ -246,7 +290,7 @@ que esta ferramenta **não** protege. Em resumo:
 ## Testes
 
 ```bash
-./tests/test-bwcc.sh       # 58 testes, offline, sem conta e sem rede
+./tests/test-bwcc.sh       # 76 testes, offline, sem conta e sem rede
 ```
 
 Os caminhos que exigem cofre de verdade (Touch ID, leitura, injeção) estão em

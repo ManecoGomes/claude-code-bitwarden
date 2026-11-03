@@ -31,12 +31,25 @@ máquina do usuário. Então:
 Não adivinhe nome de item nem de campo.
 
 ```bash
-bwcc list github          # itens que casam com "github": nome, usuário, domínio, id
+bwcc list teste           # itens que casam: nome, usuário, domínio, onde casou, id
 bwcc fields "GitHub"      # quais campos esse item tem — sem os valores
 ```
 
+**Busque pelo termo que o usuário usou, literalmente.** Se ele disser "vê o
+conteúdo de teste no Bitwarden", procure `teste` — não procure pelos nomes que
+você mesmo usaria. Essa busca cobre nome, usuário, URI, **nota** e **campos
+custom**, ignora acento (`avaliacao` acha `Avaliação`), ignora caixa e aceita as
+palavras em qualquer ordem. Então um "não encontrei" só vale se você buscou o
+termo dele; se buscou outro, você não procurou.
+
+A coluna `CASOU EM` diz onde o termo bateu (`nome`, `usuario`, `uri`, `nota`,
+`campos`) sem mostrar o valor — útil pra achar item pelo conteúdo secreto sem
+expor o conteúdo.
+
 Se a busca casar com vários itens, `bwcc` lista os candidatos e sai com erro em
-vez de escolher um. Mostre a lista ao usuário e pergunte qual é.
+vez de escolher um. Mostre a lista ao usuário e pergunte qual é. Nome exato
+ganha de parcial, então `bwcc get GitHub` não reclama por causa de
+`GitHub Enterprise`.
 
 ## Ler
 

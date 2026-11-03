@@ -36,6 +36,9 @@ Pré-requisito: `bwcc doctor` com tudo ✓ e `bw login` feito.
 | 27 | disparar desbloqueio com outra janela em foco | o diálogo nasce **na frente** (sem o `activate` ele abre atrás e você espera um prompt invisível) |
 | 28 | abrir o diálogo e não responder | desiste em `BWCC_UNLOCK_TIMEOUT` (120s) com "sem resposta", em vez de pendurar o comando |
 | 29 | cancelar o diálogo, depois `security find-generic-password -s bwcc-session -w` | **nada** no Keychain: falha de desbloqueio não grava sessão vazia |
+| 30 | `bwcc list <palavra que só existe numa nota>` | encontra o item, com `CASOU EM = nota` e **sem** mostrar o texto da nota |
+| 31 | `bwcc list <termo com acento>` e a versão sem acento | mesmo resultado nos dois |
+| 32 | `bwcc get <nome exato>` quando existe outro item com esse nome como prefixo | resolve pro exato, sem erro de ambiguidade |
 | 20 | `security find-generic-password -s bwcc-session -w` | devolve `<timestamp>:<chave>` — confirma onde a sessão mora |
 
 Limpeza: `bwcc lock` e apague o item `teste-bwcc` no app.

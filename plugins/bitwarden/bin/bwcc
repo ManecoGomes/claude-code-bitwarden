@@ -16,7 +16,7 @@
 set -euo pipefail
 umask 077
 
-BWCC_VERSION="0.2.0"
+BWCC_VERSION="0.3.0"
 
 # ---------------------------------------------------------------------------
 # configuration
@@ -236,7 +236,15 @@ bw_login_state() {
 # usage mistake reports a usage error rather than a login error. Must be invoked
 # from the main process: a `die` inside a command substitution would only kill
 # that subshell and let execution continue.
-need_vault() { require_login; }
+# Uma sessão em cache só existe se houve login — então checar login de novo
+# custaria uma partida do Node (~2,5s) para confirmar o que já se sabe. No
+# caminho frio (sem sessão) a checagem acontece, e aí ela é amortizada pelo
+# desbloqueio que vem a seguir.
+need_vault() {
+  [ -n "${BW_SESSION:-}" ] && return 0
+  [ -n "$(session_get)" ] && return 0
+  require_login
+}
 
 require_login() {
   local st; st="$(bw_login_state)"
@@ -367,6 +375,65 @@ bw_call() {
 }
 
 # ---------------------------------------------------------------------------
+# busca
+#
+# O `--search` do CLI oficial só olha nome, usuário e URI, e é sensível a
+# acento: um item "Avaliação" não aparece em "avaliacao", e conteúdo que vive
+# em nota ou campo custom é invisível. Aqui a busca roda local sobre o cofre
+# inteiro — sem acento, sem caixa, palavras em qualquer ordem — varrendo
+# nome + usuário + URI + nota + campos.
+#
+# O programa jq vem de heredoc *quoted*: em aspas duplas o bash comeria os
+# $toks/$parts do próprio jq.
+# ---------------------------------------------------------------------------
+BWCC_JQ_NORM=$(cat <<'JQ'
+def deaccent:
+  gsub("[àáâãäåÀÁÂÃÄÅ]";"a") | gsub("[èéêëÈÉÊË]";"e")
+  | gsub("[ìíîïÌÍÎÏ]";"i")   | gsub("[òóôõöÒÓÔÕÖ]";"o")
+  | gsub("[ùúûüÙÚÛÜ]";"u")   | gsub("[çÇ]";"c")
+  | gsub("[ñÑ]";"n")         | gsub("[ýÿÝ]";"y");
+def norm: (if type == "string" then . else "" end) | deaccent | ascii_downcase;
+JQ
+)
+
+BWCC_JQ_FILTER=$(cat <<'JQ'
+($q | norm | [splits("[[:space:]]+")] | map(select(length > 0))) as $toks
+| map(
+    . as $it
+    | {
+        nome:    ($it.name // "" | norm),
+        usuario: ($it.login.username // "" | norm),
+        uri:     ([($it.login.uris // [])[].uri // ""] | join(" ") | norm),
+        nota:    ($it.notes // "" | norm),
+        campos:  ([($it.fields // [])[] | ((.name // "") + " " + (.value // ""))]
+                  | join(" ") | norm)
+      }
+    | to_entries as $parts
+    | if ([ $toks[] as $t | ($parts | map(select(.value | contains($t))) | length > 0) ] | all)
+      then $it + {_onde: ([ $parts[]
+                            | select([ $toks[] as $t | (.value | contains($t)) ] | any)
+                            | .key ] | join(","))}
+      else empty
+      end)
+JQ
+)
+
+# Recebe o array de itens no stdin; devolve os que casam, cada um com "_onde"
+# dizendo em que parte casou — sem nunca revelar o valor dessa parte.
+filter_items() {
+  local q="${1:-}"
+  if [ -z "$q" ]; then cat; return; fi
+  json --arg q "$q" "$BWCC_JQ_NORM
+$BWCC_JQ_FILTER"
+}
+
+search_items() {
+  local items
+  items="$(bw_call list items)" || die "falha ao listar itens: $items"
+  printf '%s' "$items" | filter_items "${1:-}"
+}
+
+# ---------------------------------------------------------------------------
 # items and fields
 # ---------------------------------------------------------------------------
 is_uuid() {
@@ -378,9 +445,11 @@ is_uuid() {
 item_json() {
   local q="$1" items exact n
   if is_uuid "$q"; then bw_call get item "$q"; return; fi
-  items="$(bw_call list items --search "$q")" || die "falha ao buscar itens: $items"
-  exact="$(printf '%s' "$items" | json --arg q "$q" \
-    '[.[] | select(((.name // "") | ascii_downcase) == (($q) | ascii_downcase))]')"
+  items="$(search_items "$q")"
+  # Nome exato (ignorando acento e caixa) ganha de casamento parcial: senão
+  # "GitHub" perderia para "GitHub Enterprise" numa busca ambígua.
+  exact="$(printf '%s' "$items" | json --arg q "$q" "$BWCC_JQ_NORM"'
+    [.[] | select((.name | norm) == ($q | norm))]')"
   if [ "$(printf '%s' "$exact" | json 'length')" = "1" ]; then
     printf '%s' "$exact" | json '.[0]'
     return
@@ -391,7 +460,8 @@ item_json() {
     1) printf '%s' "$items" | json '.[0]' ;;
     *)
       printf 'bwcc: %s itens casam com "%s". Use o nome exato ou o id:\n' "$n" "$q" >&2
-      printf '%s' "$items" | json -r '.[] | "  \(.id)  \(.name)  [\(.login.username // "-")]"' >&2
+      printf '%s' "$items" | json -r \
+        '.[] | "  \(.id)  \(.name)  [\(.login.username // "-")]  (casou em: \(._onde // "-"))"' >&2
       exit 2
       ;;
   esac
@@ -607,12 +677,13 @@ cmd_doctor() {
 cmd_list() {
   local q="${1:-}" items
   need_vault
-  if [ -n "$q" ]; then items="$(bw_call list items --search "$q")"; else items="$(bw_call list items)"; fi
+  items="$(search_items "$q")"
   printf '%s' "$items" | json -r '
-    (["NOME","USUÁRIO","URI","ID"] | @tsv),
+    (["NOME","USUÁRIO","URI","CASOU EM","ID"] | @tsv),
     (.[] | [ (.name // "-"),
              (.login.username // "-"),
              (((.login.uris // [])[0].uri // "-") | sub("^https?://";"") | sub("/.*$";"")),
+             (._onde // "-"),
              .id ] | @tsv)' \
     | { if have column; then column -t -s "$(printf '\t')"; else cat; fi; }
 }

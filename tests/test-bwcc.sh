@@ -32,7 +32,7 @@ ITEM='{"id":"3f1a","name":"GitHub","type":1,
 echo "bwcc — testes offline"
 echo
 echo "superfície do CLI"
-eq "--version imprime a versão" "bwcc 0.2.0" "$("$BWCC" --version)"
+eq "--version imprime a versão" "bwcc 0.3.0" "$("$BWCC" --version)"
 contains "--help documenta o run" "bwcc run" "$("$BWCC" --help)"
 out="$("$BWCC" comando-que-nao-existe 2>&1)"; rc=$?
 eq   "comando inválido sai com erro" "1" "$rc"
@@ -46,6 +46,42 @@ eq "nome com espaço"         "Supabase MGE|password" "$(T split_ref 'bw://Supab
 eq "campo com espaço"        "Item|connection string" "$(T split_ref 'bw://Item/connection string' | tr '\t' '|')"
 contains "sem esquema é rejeitado" "referência inválida" "$(T split_ref 'GitHub/password' 2>&1)"
 contains "referência vazia é rejeitada" "referência" "$(T split_ref 'bw://' 2>&1)"
+
+echo
+echo "busca: acento, caixa, ordem das palavras, nota e campos"
+ITENS='[
+ {"id":"1","name":"BitWarden teste Claude","type":2,"notes":"12 de Janeiro","login":null},
+ {"id":"2","name":"Avaliação Imóvel","type":1,"notes":null,
+  "login":{"username":"Maneco@CarusoGomes.adv.br","uris":[{"uri":"https://avaliaz.com.br/x"}]}},
+ {"id":"3","name":"GitHub","type":1,"login":{"username":"ManecoGomes","uris":[{"uri":"https://github.com"}]}},
+ {"id":"4","name":"GitHub Enterprise","type":1,"login":{"username":"maneco","uris":[]}},
+ {"id":"5","name":"Supabase MGE","type":1,
+  "login":{"username":"adm","uris":[]},
+  "fields":[{"name":"connection_string","type":1,"value":"postgres://xyz"}]}
+]'
+busca() { printf '%s' "$ITENS" | T filter_items "$1" | jq -r '[.[].name] | join("|")'; }
+onde()  { printf '%s' "$ITENS" | T filter_items "$1" | jq -r '.[0]._onde // "-"'; }
+
+eq "minúscula acha nome com maiúscula"   "BitWarden teste Claude"   "$(busca teste)"
+eq "maiúscula acha mesmo assim"          "BitWarden teste Claude"   "$(busca TESTE)"
+eq "palavras em qualquer ordem"          "BitWarden teste Claude"   "$(busca "claude teste")"
+eq "sem acento acha com acento"          "Avaliação Imóvel"         "$(busca avaliacao)"
+eq "com acento acha também"              "Avaliação Imóvel"         "$(busca AVALIAÇÃO)"
+eq "ó sem acento (imovel)"               "Avaliação Imóvel"         "$(busca imovel)"
+eq "acha conteúdo que só existe na nota" "BitWarden teste Claude"   "$(busca "12 de janeiro")"
+eq "acha por nome de campo custom"       "Supabase MGE"             "$(busca connection_string)"
+eq "acha por valor de campo custom"      "Supabase MGE"             "$(busca postgres)"
+eq "acha pelo usuário"                   "Avaliação Imóvel"         "$(busca carusogomes)"
+eq "acha pela URI"                       "GitHub"                   "$(busca github.com)"
+eq "prefixo casa os dois GitHub"         "GitHub|GitHub Enterprise" "$(busca github)"
+eq "termo inexistente não casa nada"     ""                         "$(busca xyzabc)"
+eq "busca vazia devolve tudo"            "5" \
+   "$(printf '%s' "$ITENS" | T filter_items "" | jq -r 'length')"
+eq "diz que casou na nota"               "nome,nota" "$(onde "12 de janeiro")"
+eq "diz que casou em campos"             "campos"    "$(onde connection_string)"
+eq "diz que casou no usuário"            "usuario"   "$(onde carusogomes)"
+not_contains "o campo _onde não revela o conteúdo da nota" "12 de Janeiro" \
+   "$(printf '%s' "$ITENS" | T filter_items "12 de janeiro" | jq -r '.[0]._onde')"
 
 echo
 echo "classificação de campos"
