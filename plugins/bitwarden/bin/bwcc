@@ -16,7 +16,7 @@
 set -euo pipefail
 umask 077
 
-BWCC_VERSION="0.3.0"
+BWCC_VERSION="0.3.1"
 
 # ---------------------------------------------------------------------------
 # configuration
@@ -225,7 +225,7 @@ session_remaining() {
 }
 
 bw_status_json() {
-  BW_SESSION="" "$BW_BIN" status 2>/dev/null | tail -n 1
+  BW_NOINTERACTION=true BW_SESSION="" "$BW_BIN" status 2>/dev/null | tail -n 1
 }
 
 bw_login_state() {
@@ -359,16 +359,22 @@ bw_call() {
   sess="$(ensure_session)" || exit 1
   [ -n "$sess" ] || die "sem sessão válida do Bitwarden"
   set +e
-  out="$(BW_SESSION="$sess" "$BW_BIN" "$@" 2>&1)"; rc=$?
+  out="$(BW_NOINTERACTION=true BW_SESSION="$sess" "$BW_BIN" "$@" 2>&1)"; rc=$?
   set -e
-  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qiE 'locked|invalid session|session key|more than one'; then
-    if printf '%s' "$out" | grep -qiE 'locked|invalid session|session key'; then
-      session_clear
-      sess="$(ensure_session)"
-      set +e
-      out="$(BW_SESSION="$sess" "$BW_BIN" "$@" 2>&1)"; rc=$?
-      set -e
-    fi
+  if printf '%s' "$out" | grep -qiE 'not logged in'; then
+    die "você não está logado no Bitwarden. Rode em um terminal seu:  bw login"
+  fi
+  # Sessão em cache pode estar MORTA: desbloquear de novo, em qualquer lugar,
+  # invalida a chave anterior. Validar antes custaria uma partida do Node por
+  # comando; descobrir aqui, no erro, é de graça.
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" \
+       | grep -qiE 'locked|invalid session|session key|master password|readline'; then
+    session_clear
+    sess="$(ensure_session)" || return 1
+    [ -n "$sess" ] || return 1
+    set +e
+    out="$(BW_NOINTERACTION=true BW_SESSION="$sess" "$BW_BIN" "$@" 2>&1)"; rc=$?
+    set -e
   fi
   printf '%s' "$out"
   return "$rc"
@@ -429,7 +435,14 @@ $BWCC_JQ_FILTER"
 
 search_items() {
   local items
-  items="$(bw_call list items)" || die "falha ao listar itens: $items"
+  # Sem detalhe do bw, não imprimir uma linha de erro vazia: quem chama já diz
+  # "não consegui ler o cofre".
+  items="$(bw_call list items)" || { [ -n "$items" ] && warn "bw: $items"; return 1; }
+  if ! printf '%s' "$items" | json -e . >/dev/null 2>&1; then
+    warn "o CLI do Bitwarden devolveu algo que não é JSON:"
+    warn "  $(printf '%s' "$items" | tr -d '\r' | head -1 | cut -c1-120)"
+    return 1
+  fi
   printf '%s' "$items" | filter_items "${1:-}"
 }
 
@@ -445,7 +458,7 @@ is_uuid() {
 item_json() {
   local q="$1" items exact n
   if is_uuid "$q"; then bw_call get item "$q"; return; fi
-  items="$(search_items "$q")"
+  items="$(search_items "$q")" || die "não consegui ler o cofre"
   # Nome exato (ignorando acento e caixa) ganha de casamento parcial: senão
   # "GitHub" perderia para "GitHub Enterprise" numa busca ambígua.
   exact="$(printf '%s' "$items" | json --arg q "$q" "$BWCC_JQ_NORM"'
@@ -536,7 +549,7 @@ cmd_status() {
   # consegue ler o cofre AGORA, ou seja, com a sessão que ele tem em cache.
   cached="$(session_get)"
   if [ -n "$cached" ] && [ "$st" != "unauthenticated" ]; then
-    eff="$(BW_SESSION="$cached" "$BW_BIN" status 2>/dev/null | tail -n 1 \
+    eff="$(BW_NOINTERACTION=true BW_SESSION="$cached" "$BW_BIN" status 2>/dev/null | tail -n 1 \
            | json -r '.status // empty' 2>/dev/null || true)"
     [ -n "$eff" ] && st="$eff (pela sessão em cache)"
   fi
@@ -677,7 +690,7 @@ cmd_doctor() {
 cmd_list() {
   local q="${1:-}" items
   need_vault
-  items="$(search_items "$q")"
+  items="$(search_items "$q")" || die "não consegui ler o cofre"
   printf '%s' "$items" | json -r '
     (["NOME","USUÁRIO","URI","CASOU EM","ID"] | @tsv),
     (.[] | [ (.name // "-"),

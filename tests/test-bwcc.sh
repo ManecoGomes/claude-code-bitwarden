@@ -32,7 +32,7 @@ ITEM='{"id":"3f1a","name":"GitHub","type":1,
 echo "bwcc — testes offline"
 echo
 echo "superfície do CLI"
-eq "--version imprime a versão" "bwcc 0.3.0" "$("$BWCC" --version)"
+eq "--version imprime a versão" "bwcc 0.3.1" "$("$BWCC" --version)"
 contains "--help documenta o run" "bwcc run" "$("$BWCC" --help)"
 out="$("$BWCC" comando-que-nao-existe 2>&1)"; rc=$?
 eq   "comando inválido sai com erro" "1" "$rc"

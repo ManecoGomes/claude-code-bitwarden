@@ -1,7 +1,7 @@
 {
   "name": "bitwarden",
   "description": "Busca e usa segredos do seu cofre Bitwarden a partir do Claude Code. Desbloqueio por Touch ID via app desktop, sessão em cache no Keychain e segredos mascarados por padrão.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "author": {
     "name": "Maneco Gomes",
     "url": "https://github.com/ManecoGomes"

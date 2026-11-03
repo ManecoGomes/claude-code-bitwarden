@@ -9,7 +9,7 @@
     {
       "name": "bitwarden",
       "source": "./plugins/bitwarden",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "category": "security",
       "tags": ["bitwarden", "secrets", "password-manager", "macos", "touch-id", "vault"]
     }
